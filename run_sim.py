@@ -14,7 +14,9 @@ from joblib import Parallel, delayed
 from numpy.typing import NDArray
 import pandas as pd
 
-sys.path.insert(0, ".")
+# sys.path.insert(0, ".")
+# from SSA.numba_1d import make_ssa_state_1d, SSAState1D
+
 from numba_1d_plus import make_ssa_state_1d, SSAState1D
 
 
@@ -41,7 +43,7 @@ class ExperimentConfig:
     gaussian_cutoff_sigmas: float = 5.0
 
     # Sweep по d внутри каждой пары (sigma, d_prime)
-    d_test_range: tuple[float, float, int] = (0.01, 0.1, 10)
+    d_test_range: tuple[float, float, int] = (0.01, 0.01, 1)
 
     # Warmup
     initial_density_frac: float = 0.1
@@ -356,6 +358,7 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
         cell_count=cell_count,
         cell_capacity=cell_capacity,
         is_periodic=True,
+        resync_interval=10000,
         seed=seed,
     )
 
@@ -512,6 +515,6 @@ def run_sigma_d_prime_grid(cfg: ExperimentConfig) -> list[dict]:
 # =============================================================================
 def main(cfg: ExperimentConfig) -> None:
     points_rows = run_sigma_d_prime_grid(cfg)
-
+    
     out_dir = Path(cfg.output_dir)
     pd.DataFrame(points_rows).to_csv(out_dir / cfg.points_filename, index=False)

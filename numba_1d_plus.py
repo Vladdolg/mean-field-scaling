@@ -63,9 +63,26 @@ def _sample_weighted_impl(values: NDArray[np.float64]) -> int:
     return n - 1
 
 
+def _sample_weighted_total_impl(values: NDArray[np.float64], total: float) -> int:
+    # Same as _sample_weighted_impl, but the sum is supplied by the caller
+    # (a running aggregate that the state already maintains), so the first
+    # O(n) summation pass is skipped. Only the O(n) cumulative scan remains.
+    n = values.shape[0]
+    if total <= 0.0:
+        return -1
+    r = np.random.random() * total
+    cumulative = 0.0
+    for idx in range(n):
+        cumulative += values[idx]
+        if r <= cumulative:
+            return idx
+    return n - 1
+
+
 _interp_uniform = njit(cache=True)(_interp_uniform_impl)
 _distance_1d = njit(cache=True)(_distance_1d_impl)
 _sample_weighted = njit(cache=True)(_sample_weighted_impl)
+_sample_weighted_total = njit(cache=True)(_sample_weighted_total_impl)
 
 
 ssa_state_spec = [
@@ -106,6 +123,8 @@ ssa_state_spec = [
     ("time", types.float64),
     ("event_count", types.int64),
     ("capacity_flag", types.uint8),
+    ("resync_interval", types.int64),
+    ("events_since_resync", types.int64),
 ]
 
 
@@ -202,11 +221,70 @@ class SSAState1D:
         self.event_count = np.int64(0)
         self.capacity_flag = np.uint8(0)
 
+        self.resync_interval = np.int64(0)
+        self.events_since_resync = np.int64(0)
+
         if seed_value >= 0:
             np.random.seed(int(seed_value))
 
     def _sample_weighted_local(self, values: NDArray[np.float64]) -> int:
         return _sample_weighted(values)
+
+    def _sample_weighted_total_local(self, values: NDArray[np.float64], total: float) -> int:
+        return _sample_weighted_total(values, total)
+
+    def set_resync_interval(self, interval: int) -> None:
+        # interval <= 0 disables periodic resync (original behaviour).
+        if interval < 0:
+            interval = 0
+        self.resync_interval = np.int64(interval)
+        self.events_since_resync = np.int64(0)
+
+    def resync_rates(self) -> None:
+        # Recompute the running aggregates that sampling now relies on, so
+        # accumulated floating-point drift in total_*_rate and cell_*_rate
+        # cannot bias the weighted sampling. Birth rates depend only on exact
+        # integer counts; death aggregates are re-summed from the per-particle
+        # death_rates (the per-particle values themselves are NOT recomputed
+        # here -- that would require re-scanning all pairwise interactions).
+        spec_total = int(self.species_count)
+        cells = int(self.cell_count)
+        n = int(self.population_total)
+ 
+        for c in range(cells):
+            self.cell_birth_rate[c] = 0.0
+            self.cell_death_rate[c] = 0.0
+            for s in range(spec_total):
+                self.cell_birth_rate_by_species[c, s] = 0.0
+                self.cell_death_rate_by_species[c, s] = 0.0
+ 
+        for c in range(cells):
+            cell_br = 0.0
+            for s in range(spec_total):
+                br = self.b[s] * self.cell_species_counts[c, s]
+                self.cell_birth_rate_by_species[c, s] = br
+                cell_br += br
+            self.cell_birth_rate[c] = cell_br
+ 
+        for idx in range(n):
+            s = self.species[idx]
+            c = self.cell_index[idx]
+            dr = self.death_rates[idx]
+            self.cell_death_rate_by_species[c, s] += dr
+            self.cell_death_rate[c] += dr
+ 
+        tb = 0.0
+        td = 0.0
+        for c in range(cells):
+            tb += self.cell_birth_rate[c]
+            td += self.cell_death_rate[c]
+        self.total_birth_rate = tb
+        self.total_death_rate = td
+
+    def _make_resync(self) -> None:
+        if self.resync_interval > 0 and self.events_since_resync >= self.resync_interval:
+            self.resync_rates()
+            self.events_since_resync = np.int64(0)
 
     def _distance(self, pos_a: float, pos_b: float) -> float:
         return _distance_1d(pos_a, pos_b, self.area_length, self.periodic_flag)
@@ -255,16 +333,13 @@ class SSAState1D:
         return -1
 
     def _sample_victim(self, cell_idx: int, species_id: int) -> int:
-        total = 0.0
-        count = self.cell_counts[cell_idx]
-        for slot in range(count):
-            pid = self.cell_particles[cell_idx, slot]
-            if pid == -1:
-                continue
-            if self.species[pid] == species_id:
-                total += self.death_rates[pid]
+        # Reuse the maintained per-cell/per-species death aggregate instead of
+        # re-summing the particles' death_rates. The subsequent scan still walks
+        # the particles to pick the victim.
+        total = self.cell_death_rate_by_species[cell_idx, species_id]
         if total <= 0.0:
             return -1
+        count = self.cell_counts[cell_idx]
         r = np.random.random() * total
         for slot in range(count):
             pid = self.cell_particles[cell_idx, slot]
@@ -477,11 +552,15 @@ class SSAState1D:
         return True
 
     def attempt_birth_event(self) -> bool:
-        cell_idx = self._sample_weighted_local(self.cell_birth_rate)
+        cell_idx = self._sample_weighted_total_local(
+            self.cell_birth_rate, self.total_birth_rate
+        )
         if cell_idx < 0:
             return False
 
-        species_id = self._sample_weighted_local(self.cell_birth_rate_by_species[cell_idx])
+        species_id = self._sample_weighted_total_local(
+            self.cell_birth_rate_by_species[cell_idx], self.cell_birth_rate[cell_idx]
+        )
         if species_id < 0:
             return False
 
@@ -506,11 +585,15 @@ class SSAState1D:
         return self.spawn_particle(species_id, child_pos)
 
     def attempt_death_event(self) -> bool:
-        cell_idx = self._sample_weighted_local(self.cell_death_rate)
+        cell_idx = self._sample_weighted_total_local(
+            self.cell_death_rate, self.total_death_rate
+        )
         if cell_idx < 0:
             return False
 
-        species_id = self._sample_weighted_local(self.cell_death_rate_by_species[cell_idx])
+        species_id = self._sample_weighted_total_local(
+            self.cell_death_rate_by_species[cell_idx], self.cell_death_rate[cell_idx]
+        )
         if species_id < 0:
             return False
 
@@ -531,6 +614,7 @@ class SSAState1D:
             return 0
         performed = 0
         for _ in range(max_events):
+            self._make_resync()
             total_rate = self.total_birth_rate + self.total_death_rate
             if total_rate <= 1e-12:
                 break
@@ -542,12 +626,14 @@ class SSAState1D:
                 if self.attempt_birth_event():
                     performed += 1
                     self.event_count += 1
+                    self.events_since_resync += 1
                 elif self.capacity_flag == 1:
                     break
             else:
                 if self.attempt_death_event():
                     performed += 1
                     self.event_count += 1
+                    self.events_since_resync += 1
         return performed
 
     def run_until_time(self, duration: float) -> int:
@@ -556,6 +642,7 @@ class SSAState1D:
         target_time = self.time + duration
         performed = 0
         while self.time < target_time:
+            self._make_resync()
             total_rate = self.total_birth_rate + self.total_death_rate
             if total_rate <= 1e-12:
                 break
@@ -568,12 +655,14 @@ class SSAState1D:
                 if self.attempt_birth_event():
                     performed += 1
                     self.event_count += 1
+                    self.events_since_resync += 1
                 elif self.capacity_flag == 1:
                     break
             else:
                 if self.attempt_death_event():
                     performed += 1
                     self.event_count += 1
+                    self.events_since_resync += 1
         return performed
 
     def make_event(self) -> bool:
@@ -613,6 +702,7 @@ def make_ssa_state_1d(
     is_periodic: bool = False,
     seed: int | None = None,
     initial_population: Sequence[Sequence[float]] | None = None,
+    resync_interval: int = 0,
 ) -> SSAState1D:
     species_count = int(M)
     area_len_f = float(area_len)
@@ -679,6 +769,9 @@ def make_ssa_state_1d(
             for pos in arr:
                 if not state.spawn_particle(species_id, float(pos)):
                     raise RuntimeError("initial population exceeds configured capacity")
+
+    if resync_interval and int(resync_interval) > 0:
+        state.set_resync_interval(int(resync_interval))
 
     return state
 
