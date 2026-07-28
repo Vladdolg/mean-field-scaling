@@ -14,9 +14,6 @@ from joblib import Parallel, delayed
 from numpy.typing import NDArray
 import pandas as pd
 
-# sys.path.insert(0, ".")
-# from SSA.numba_1d import make_ssa_state_1d, SSAState1D
-
 from numba_1d_plus import make_ssa_state_1d, SSAState1D
 
 
@@ -50,12 +47,11 @@ class ExperimentConfig:
     warmup_threshold_frac: float = 0.50        # ждём 50% от pop_exp перед Z-тестом
     warmup_min_stable_windows: int = 10        # 10 пройденных проверок подряд
     warmup_event_chunk: int = 5000
-    max_warmup_wall_seconds: float = 3000.0
+    max_warmup_batches: int = 10000
 
     # Warmup: критерий стационарности через тест ЭКВИВАЛЕНТНОСТИ E[Z] ≈ 0
     warmup_z_min_windows: int = 10          # минимум накопленных окон перед проверкой
-    warmup_z_tcrit: float = 2.0         # множитель для полуширины ДИ E[Z]
-    warmup_z_resolution: float = 1e-2   # δ = res * b * n̂  — граница допуска на дрейф
+    warmup_z_resolution: float = 1e-3   # δ = res * b * n̂  — граница допуска на дрейф
 
     # Измерения по физическому времени
     event_frac: float = 0.10
@@ -171,15 +167,33 @@ def estimate_autocorrelation_time(samples: NDArray[np.float64], max_lag: int = 1
 
 def compute_mean_and_ci_from_batch_means(
     batch_means: list[float], confidence: float
-) -> tuple[float, float, float, float, float]:
+) -> dict:
     arr = np.asarray(batch_means)
+
+    out = {
+        "density_mean": np.nan, 
+        "density_mean_se": np.nan,
+        "density_half_width": np.inf,
+        "density_ci_lower": -np.inf, 
+        "density_ci_upper": np.inf,
+        }
+    
     mean = float(arr.mean())
+    out.update({"density_mean": mean})
     if arr.size < 2:
-        return mean, math.inf, math.inf, -math.inf, math.inf
+        return out
+    
     se = float(arr.std(ddof=1) / math.sqrt(arr.size))
     alpha = 1.0 - confidence
     half_width = float(NormalDist().inv_cdf(1.0 - alpha / 2.0)) * se
-    return mean, se, half_width, mean - half_width, mean + half_width
+    
+    out.update({ 
+        "density_mean_se": se,
+        "density_half_width": half_width,
+        "density_ci_lower": mean - half_width, 
+        "density_ci_upper": mean + half_width,
+        })
+    return out
 
 def compute_cv_estimate(
     n_means: NDArray[np.float64],
@@ -203,8 +217,8 @@ def compute_cv_estimate(
 
     out = {
         "cv_mean": np.nan, "cv_se": np.nan, "cv_half_width": np.inf,
-        "cv_lo": -np.inf, "cv_hi": np.inf,
-        "c_hat_full": np.nan, "corr_batch": np.nan, "var_reduction": np.nan,
+        "cv_lower": -np.inf, "cv_upper": np.inf,
+        "c_full": np.nan, "corr_batch": np.nan, "var_reduction": np.nan,
         "z_mean": np.nan, "z_mean_se": np.nan, "z_tstat": np.nan,
     }
     if m < 3:
@@ -245,8 +259,8 @@ def compute_cv_estimate(
 
     out.update({
         "cv_mean": cv_mean, "cv_se": cv_se, "cv_half_width": cv_hw,
-        "cv_lo": cv_mean - cv_hw, "cv_hi": cv_mean + cv_hw,
-        "c_hat_full": c_full, "corr_batch": corr_b, "var_reduction": var_red,
+        "cv_lower": cv_mean - cv_hw, "cv_upper": cv_mean + cv_hw,
+        "c_full": c_full, "corr_batch": corr_b, "var_reduction": var_red,
         "z_mean": z_mean, "z_mean_se": z_se, "z_tstat": z_t,
     })
     return out
@@ -313,7 +327,7 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
     # тривиально на вымершей конфигурации.
     phase1_chunks = 0
     while sim.current_population() < threshold_pop:
-        if time.perf_counter() - warmup_start > cfg.max_warmup_wall_seconds:
+        if phase1_chunks > cfg.max_warmup_batches:
             return _return(phase1_chunks, np.nan, 0, 0, 0)
         sim.run_events(cfg.warmup_event_chunk)
         phase1_chunks += 1
@@ -340,10 +354,7 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
     # SE входит в критерий, поэтому пройти при большом SE нельзя — гарантия
     # разрешения встроена в саму остановку.
     w_min = max(2, cfg.warmup_z_min_windows)
-    tcrit = cfg.warmup_z_tcrit
-    res = cfg.warmup_z_resolution
 
-    k = 0
     Sz = 0.0
     Szz = 0.0
     Sn = 0.0
@@ -351,32 +362,31 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
     z_mean = z_se = z_t = np.nan
 
     while True:
-        if time.perf_counter() - warmup_start > cfg.max_warmup_wall_seconds:
+        if stability_windows + phase1_chunks > cfg.max_warmup_batches:
             return _return(phase1_chunks, tau_int, window_size,
                          stability_windows, z_mean, z_se, z_t)
 
         win_n, win_z = collect_samples_time(sim, cfg, window_size, pilot_dt)
         zw = float(win_z.mean())
         nw = float(win_n.mean())
-        k += 1
         Sz += zw
         Szz += zw * zw
         Sn += nw
-        stability_windows = k
+        stability_windows +=1
 
-        if k < w_min:
+        if stability_windows < w_min:
             continue
 
-        z_mean = Sz / k
-        var = (Szz - k * z_mean * z_mean) / (k - 1)
+        z_mean = Sz / stability_windows
+        var = (Szz - stability_windows * z_mean * z_mean) / (stability_windows - 1)
         if var < 0.0:
             var = 0.0
-        z_se = math.sqrt(var / k)
+        z_se = math.sqrt(var / stability_windows)
         z_t = z_mean / z_se if z_se > 0.0 else np.inf
 
-        n_hat = Sn / k
-        delta = res * cfg.b * n_hat
-        margin = abs(z_mean) + tcrit * z_se
+        n_hat = Sn / stability_windows
+        delta = cfg.warmup_z_resolution * cfg.b * n_hat
+        margin = abs(z_mean) + float(NormalDist().inv_cdf(0.975)) * z_se
 
         if delta > 0.0 and margin <= delta:
             return _return(phase1_chunks, tau_int, window_size,
@@ -429,7 +439,7 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
         "cv_density_half_width": np.nan,
         "cv_density_ci_lower": np.nan,
         "cv_density_ci_upper": np.nan,
-        "c_hat_full": np.nan,
+        "c_full": np.nan,
         "corr_batch": np.nan,
         "corr_sample": np.nan,
         "var_reduction": np.nan,
@@ -549,26 +559,22 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
     measurement_time_wall = time.perf_counter() - measurement_start_wall
 
     # наивная оценка — baseline для сравнения (в остановке не участвует)
-    density_mean, density_mean_se, density_half_width, density_lo, density_hi = (
-        compute_mean_and_ci_from_batch_means(n_batch_means, cfg.ci_confidence)
-    )
-    cv = compute_cv_estimate(
-        np.asarray(n_batch_means), np.asarray(z_batch_means), cfg.ci_confidence
-    )
+    n = compute_mean_and_ci_from_batch_means(n_batch_means, cfg.ci_confidence)
+    cv = compute_cv_estimate(np.asarray(n_batch_means), np.asarray(z_batch_means), cfg.ci_confidence)
 
     res.update(
         {
-            "density_mean": density_mean,
-            "density_mean_se": density_mean_se,
-            "density_half_width": density_half_width,
-            "density_ci_lower": density_lo,
-            "density_ci_upper": density_hi,
+            "density_mean": n["density_mean"],
+            "density_mean_se": n["density_mean_se"],
+            "density_half_width": n["density_half_width"],
+            "density_ci_lower": n["density_ci_lower"],
+            "density_ci_upper": n["density_ci_upper"],
             "cv_density_mean": cv["cv_mean"],
             "cv_density_mean_se": cv["cv_se"],
             "cv_density_half_width": cv["cv_half_width"],
-            "cv_density_ci_lower": cv["cv_lo"],
-            "cv_density_ci_upper": cv["cv_hi"],
-            "c_hat_full": cv["c_hat_full"],
+            "cv_density_ci_lower": cv["cv_lower"],
+            "cv_density_ci_upper": cv["cv_upper"],
+            "c_full": cv["c_full"],
             "corr_batch": cv["corr_batch"],
             "corr_sample": corr_sample,
             "var_reduction": cv["var_reduction"],
@@ -646,7 +652,7 @@ def run_sigma_d_prime_grid(cfg: ExperimentConfig) -> list[dict]:
                     "cv_density_half_width": r["cv_density_half_width"],
                     "cv_density_ci_lower": r["cv_density_ci_lower"],
                     "cv_density_ci_upper": r["cv_density_ci_upper"],
-                    "c_hat_full": r["c_hat_full"],
+                    "c_full": r["c_full"],
                     "corr_batch": r["corr_batch"],
                     "corr_sample": r["corr_sample"],
                     "var_reduction": r["var_reduction"],
