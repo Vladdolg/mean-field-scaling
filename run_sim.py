@@ -52,10 +52,10 @@ class ExperimentConfig:
     warmup_event_chunk: int = 5000
     max_warmup_wall_seconds: float = 3000.0
 
-    # Warmup: критерий стационарности через E[Z] = 0
-    warmup_z_windows: int = 10          # W: скользящее окно из W оконных средних z̄_w
-    warmup_z_tcrit: float = 2.0         # |t| <= t_crit  ->  z̄ совместимо с нулём
-    warmup_z_resolution: float = 1e-3   # SE(z̄) <= res * b * n̂  -> тест не слепой
+    # Warmup: критерий стационарности через тест ЭКВИВАЛЕНТНОСТИ E[Z] ≈ 0
+    warmup_z_min_windows: int = 10          # минимум накопленных окон перед проверкой
+    warmup_z_tcrit: float = 2.0         # множитель для полуширины ДИ E[Z]
+    warmup_z_resolution: float = 1e-2   # δ = res * b * n̂  — граница допуска на дрейф
 
     # Измерения по физическому времени
     event_frac: float = 0.10
@@ -294,7 +294,7 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
     spawn_uniform(sim, 0, initial_pop, cfg.L)
     threshold_pop = cfg.warmup_threshold_frac * pop_exp
 
-    def _return(phase1_chunks, tau_int, window_size, stability_windows, stable_count,
+    def _return(phase1_chunks, tau_int, window_size, stability_windows,
               z_mean=np.nan, z_se=np.nan, z_t=np.nan, flag=False):
         return {
             "warmup_time_wall": time.perf_counter() - warmup_start,
@@ -303,7 +303,6 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
             "warmup_tau_int": tau_int,
             "warmup_window_size": window_size,
             "warmup_stability_windows": stability_windows,
-            "warmup_stable_count": stable_count,
             "warmup_z_mean_final": z_mean,
             "warmup_z_se_final": z_se,
             "warmup_z_tstat_final": z_t,
@@ -329,53 +328,59 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
     tau_int = estimate_autocorrelation_time(pilot_n, max_lag=cfg.pilot_max_lag)
     window_size = max(cfg.min_batch_size, int(math.ceil(cfg.batch_tau_multiple * tau_int)))
 
-    # --- Фаза 3: стационар <=> среднее Z совместимо с нулём ---
+    # --- Фаза 3: тест эквивалентности E[Z] ≈ 0 с НАКОПЛЕНИЕМ ---
     # Окна длиной >> τ_int => оконные средние z̄_w практически независимы.
-    # Принимаем стационар, когда одновременно:
-    #   (а) |t| = |mean(z̄_w)| / (std(z̄_w)/sqrt(W)) <= warmup_z_tcrit
-    #   (б) SE(z̄) <= warmup_z_resolution * b * n̂   — иначе тест просто слеп
-    #   (в) (а) и (б) держатся warmup_min_stable_windows проверок подряд
-    warmup_z_windows = cfg.warmup_z_windows
-    z_buf: list[float] = []
-    n_buf: list[float] = []
-    stable_count = 0
+    # Накапливаем ВСЕ окна: SE(z̄) ∝ 1/√k убывает со временем (сходимость,
+    # а не подбрасывание монеты). Останавливаемся, когда ДИ для E[Z] целиком
+    # лежит в допуске [-δ, +δ]:
+    #       |z̄| + t_crit * SE(z̄)  <=  δ = res * b * n̂
+    # Пока система в переходе, |z̄| велико => тест не проходит. В равновесии
+    # z̄ -> 0 и SE -> 0, поэтому левая часть -> 0 < δ, и тест проходит
+    # детерминированно, как только накопится достаточно окон.
+    # SE входит в критерий, поэтому пройти при большом SE нельзя — гарантия
+    # разрешения встроена в саму остановку.
+    w_min = max(2, cfg.warmup_z_min_windows)
+    tcrit = cfg.warmup_z_tcrit
+    res = cfg.warmup_z_resolution
+
+    k = 0
+    Sz = 0.0
+    Szz = 0.0
+    Sn = 0.0
     stability_windows = 0
     z_mean = z_se = z_t = np.nan
 
     while True:
         if time.perf_counter() - warmup_start > cfg.max_warmup_wall_seconds:
             return _return(phase1_chunks, tau_int, window_size,
-                         stability_windows, stable_count, z_mean, z_se, z_t)
+                         stability_windows, z_mean, z_se, z_t)
 
         win_n, win_z = collect_samples_time(sim, cfg, window_size, pilot_dt)
-        z_buf.append(float(win_z.mean()))
-        n_buf.append(float(win_n.mean()))
-        if len(z_buf) > warmup_z_windows:
-            z_buf.pop(0)
-            n_buf.pop(0)
-        stability_windows += 1
+        zw = float(win_z.mean())
+        nw = float(win_n.mean())
+        k += 1
+        Sz += zw
+        Szz += zw * zw
+        Sn += nw
+        stability_windows = k
 
-        if len(z_buf) < warmup_z_windows:
+        if k < w_min:
             continue
 
-        zb = np.asarray(z_buf)
-        n_mean = float(np.mean(n_buf))
-        z_mean = float(zb.mean())
-        z_se = float(zb.std(ddof=1) / math.sqrt(warmup_z_windows))
+        z_mean = Sz / k
+        var = (Szz - k * z_mean * z_mean) / (k - 1)
+        if var < 0.0:
+            var = 0.0
+        z_se = math.sqrt(var / k)
         z_t = z_mean / z_se if z_se > 0.0 else np.inf
 
-        rate_scale = cfg.b * n_mean          # естественный масштаб скорости
-        resolved = z_se <= cfg.warmup_z_resolution * rate_scale and rate_scale > 0.0
-        centered = abs(z_t) <= cfg.warmup_z_tcrit
+        n_hat = Sn / k
+        delta = res * cfg.b * n_hat
+        margin = abs(z_mean) + tcrit * z_se
 
-        if resolved and centered:
-            stable_count += 1
-        else:
-            stable_count = 0
-
-        if stable_count >= cfg.warmup_min_stable_windows:
+        if delta > 0.0 and margin <= delta:
             return _return(phase1_chunks, tau_int, window_size,
-                         stability_windows, stable_count, z_mean, z_se, z_t, flag=True)
+                         stability_windows, z_mean, z_se, z_t, flag=True)
 
 
 def collect_samples_time(
@@ -446,7 +451,6 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
         "warmup_tau_int": np.nan,
         "warmup_window_size": 0,
         "warmup_stability_windows": 0,
-        "warmup_stable_count": 0,
         "warmup_z_mean_final": np.nan,
         "warmup_z_se_final": np.nan,
         "warmup_z_tstat_final": np.nan,
@@ -492,7 +496,6 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
             "warmup_tau_int": warmup_res["warmup_tau_int"],
             "warmup_window_size": warmup_res["warmup_window_size"],
             "warmup_stability_windows": warmup_res["warmup_stability_windows"],
-            "warmup_stable_count": warmup_res["warmup_stable_count"],
             "warmup_z_mean_final": warmup_res["warmup_z_mean_final"],
             "warmup_z_se_final": warmup_res["warmup_z_se_final"],
             "warmup_z_tstat_final": warmup_res["warmup_z_tstat_final"],
@@ -665,7 +668,6 @@ def run_sigma_d_prime_grid(cfg: ExperimentConfig) -> list[dict]:
                     "warmup_tau_int": r["warmup_tau_int"],
                     "warmup_window_size": r["warmup_window_size"],
                     "warmup_stability_windows": r["warmup_stability_windows"],
-                    "warmup_stable_count": r["warmup_stable_count"],
                     "warmup_z_mean_final": r["warmup_z_mean_final"],
                     "warmup_z_se_final": r["warmup_z_se_final"],
                     "warmup_z_tstat_final": r["warmup_z_tstat_final"],
