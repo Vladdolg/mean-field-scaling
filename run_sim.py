@@ -32,18 +32,16 @@ class ExperimentConfig:
     L: float = 1000.0
 
     # Sweep по (sigma, d_prime)
-    # sigma_values = (0.50, 0.75, 1.15, 1.75, 2.6, 4.00,)
-    # d_prime_values = (0.10, 0.15, 0.25, 0.40, 0.65, 1.00,)
-    # sigma_values = (0.5, 0.6, 0.7, 0.85, 1.0, 1.2, 1.45, 1.75, 2.1, 2.5)
-    # d_prime_values = (0.10, 0.13, 0.17, 0.22, 0.28, 0.36, 0.46, 0.6, 0.78, 1.0,)
+    # sigma_values: tuple[float, ...] = (0.5, 0.6, 0.7, 0.85, 1.0, 1.2, 1.45, 1.75, 2.1, 2.5)
+    # d_prime_values: tuple[float, ...] = (0.10, 0.13, 0.17, 0.22, 0.28, 0.36, 0.46, 0.6, 0.78, 1.0,)
 
-    sigma_values = (0.5,)
-    d_prime_values = (1.0,)
+    sigma_values: tuple[float, ...] = (0.50, 0.75, 1.15, 1.75, 2.6, 4.00,)
+    d_prime_values: tuple[float, ...] = (0.10, 0.15, 0.25, 0.40, 0.65, 1.00,)
 
     gaussian_cutoff_sigmas: float = 5.0
 
     # Sweep по d внутри каждой пары (sigma, d_prime)
-    d_test_range: tuple[float, float, int] = (0.001, 0.001, 1)
+    d_test_range: tuple[float, float, int] = (0.01, 0.1, 10)
 
     # Warmup
     initial_density_frac: float = 0.1
@@ -512,14 +510,8 @@ def run_sigma_d_prime_grid(cfg: ExperimentConfig) -> list[dict]:
 # =============================================================================
 # Entry point
 # =============================================================================
-def main() -> None:
-    cfg = ExperimentConfig()
-
+def main(cfg: ExperimentConfig) -> None:
     points_rows = run_sigma_d_prime_grid(cfg)
 
     out_dir = Path(cfg.output_dir)
     pd.DataFrame(points_rows).to_csv(out_dir / cfg.points_filename, index=False)
-
-
-if __name__ == "__main__":
-    main()
