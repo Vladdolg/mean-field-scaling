@@ -47,11 +47,15 @@ class ExperimentConfig:
 
     # Warmup
     initial_density_frac: float = 0.1
-    warmup_threshold_frac: float = 0.50        # ждём 50% от pop_exp перед оценкой τ
-    warmup_stability_tol: float = 0.05        # 5% — критерий стабильности двух окон
-    warmup_min_stable_windows: int = 10        # минимум 10 стабильных окна подряд
-    warmup_event_chunk: int = 5000            # чанк до достижения порога 70%
+    warmup_threshold_frac: float = 0.50        # ждём 50% от pop_exp перед Z-тестом
+    warmup_min_stable_windows: int = 10        # 10 пройденных проверок подряд
+    warmup_event_chunk: int = 5000
     max_warmup_wall_seconds: float = 3000.0
+
+    # Warmup: критерий стационарности через E[Z] = 0
+    warmup_z_windows: int = 10          # W: скользящее окно из W оконных средних z̄_w
+    warmup_z_tcrit: float = 2.0         # |t| <= t_crit  ->  z̄ совместимо с нулём
+    warmup_z_resolution: float = 1e-3   # SE(z̄) <= res * b * n̂  -> тест не слепой
 
     # Измерения по физическому времени
     event_frac: float = 0.10
@@ -177,6 +181,76 @@ def compute_mean_and_ci_from_batch_means(
     half_width = float(NormalDist().inv_cdf(1.0 - alpha / 2.0)) * se
     return mean, se, half_width, mean - half_width, mean + half_width
 
+def compute_cv_estimate(
+    n_means: NDArray[np.float64],
+    z_means: NDArray[np.float64],
+    confidence: float,
+) -> dict:
+    """
+    n̂_CV = (1/m) * Σ_j ( n̄_j - ĉ^(-j) * z̄_j ),
+
+        ĉ^(-j) = Σ_{i≠j} (n̄_i - n̄̄^(-j))(z̄_i - z̄̄^(-j)) / Σ_{i≠j} (z̄_i - z̄̄^(-j))^2
+
+    ĉ^(-j) не использует батч j, поэтому E[ĉ^(-j) * z̄_j] = ĉ^(-j) * E[z̄_j] = 0
+    (батчи длиной >> τ_int практически независимы) — смещения нет.
+
+    CI строится по g_j = n̄_j - ĉ^(-j) * z̄_j как по iid-выборке.
+    Реализация O(m) через полные суммы, а не O(m^2).
+    """
+    n = np.asarray(n_means, dtype=np.float64)
+    z = np.asarray(z_means, dtype=np.float64)
+    m = n.size
+
+    out = {
+        "cv_mean": np.nan, "cv_se": np.nan, "cv_half_width": np.inf,
+        "cv_lo": -np.inf, "cv_hi": np.inf,
+        "c_hat_full": np.nan, "corr_batch": np.nan, "var_reduction": np.nan,
+        "z_mean": np.nan, "z_mean_se": np.nan, "z_tstat": np.nan,
+    }
+    if m < 3:
+        return out
+
+    Sn = n.sum()
+    Sz = z.sum()
+    Szz = float(z @ z)
+    Snz = float(n @ z)
+
+    m1 = m - 1
+    sn = Sn - n            # суммы без батча j
+    sz = Sz - z
+    nbar = sn / m1
+    zbar = sz / m1
+    Sxy = (Snz - n * z) - m1 * nbar * zbar
+    Sxx = (Szz - z * z) - m1 * zbar * zbar
+
+    c_loo = np.where(Sxx > 0.0, Sxy / np.where(Sxx > 0.0, Sxx, 1.0), 0.0)
+    g = n - c_loo * z
+
+    cv_mean = float(g.mean())
+    cv_se = float(g.std(ddof=1) / math.sqrt(m))
+    alpha = 1.0 - confidence
+    zq = float(NormalDist().inv_cdf(1.0 - alpha / 2.0))
+    cv_hw = zq * cv_se
+
+    # --- диагностика ---
+    var_z = float(z.var(ddof=1))
+    var_n = float(n.var(ddof=1))
+    c_full = float(np.cov(n, z, ddof=1)[0, 1] / var_z) if var_z > 0.0 else np.nan
+    corr_b = float(np.corrcoef(n, z)[0, 1]) if var_z > 0.0 and var_n > 0.0 else np.nan
+    var_red = float(g.var(ddof=1) / var_n) if var_n > 0.0 else np.nan
+
+    z_mean = float(z.mean())
+    z_se = float(z.std(ddof=1) / math.sqrt(m))
+    z_t = z_mean / z_se if z_se > 0.0 else np.nan
+
+    out.update({
+        "cv_mean": cv_mean, "cv_se": cv_se, "cv_half_width": cv_hw,
+        "cv_lo": cv_mean - cv_hw, "cv_hi": cv_mean + cv_hw,
+        "c_hat_full": c_full, "corr_batch": corr_b, "var_reduction": var_red,
+        "z_mean": z_mean, "z_mean_se": z_se, "z_tstat": z_t,
+    })
+    return out
+
 
 def compute_ci_target(
     cfg: ExperimentConfig, density_mean: float, n_mf: float
@@ -220,81 +294,113 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
     spawn_uniform(sim, 0, initial_pop, cfg.L)
     threshold_pop = cfg.warmup_threshold_frac * pop_exp
 
-    # --- Фаза 1: ждём 70% от pop_exp ---
+    def _return(phase1_chunks, tau_int, window_size, stability_windows, stable_count,
+              z_mean=np.nan, z_se=np.nan, z_t=np.nan, flag=False):
+        return {
+            "warmup_time_wall": time.perf_counter() - warmup_start,
+            "warmup_reached_target": flag,
+            "warmup_phase1_chunks": phase1_chunks,
+            "warmup_tau_int": tau_int,
+            "warmup_window_size": window_size,
+            "warmup_stability_windows": stability_windows,
+            "warmup_stable_count": stable_count,
+            "warmup_z_mean_final": z_mean,
+            "warmup_z_se_final": z_se,
+            "warmup_z_tstat_final": z_t,
+        }
+
+    # --- Фаза 1: рост до threshold_frac * pop_exp ---
+    # Гейт обязателен: при N = 0 имеем Z ≡ 0 тождественно, и Z-тест прошёл бы
+    # тривиально на вымершей конфигурации.
     phase1_chunks = 0
     while sim.current_population() < threshold_pop:
         if time.perf_counter() - warmup_start > cfg.max_warmup_wall_seconds:
-            return {
-                "warmup_time_wall": time.perf_counter() - warmup_start,
-                "warmup_reached_target": False,
-                "warmup_phase1_chunks": phase1_chunks,
-                "warmup_tau_int": np.nan,
-                "warmup_window_size": 0,
-                "warmup_stability_windows": 0,
-                "warmup_stable_count": 0,
-            }
+            return _return(phase1_chunks, np.nan, 0, 0, 0)
         sim.run_events(cfg.warmup_event_chunk)
         phase1_chunks += 1
         if sim.current_population() <= 0:
             spawn_uniform(sim, 0, initial_pop, cfg.L)
 
-    # --- Фаза 2: грубая оценка τ_int по пилотным образцам ---
+    # --- Фаза 2: грубая оценка τ_int ---
     pilot_dt = cfg.event_frac / (2.0 * cfg.b)
-    pilot_samples = collect_density_samples_time(sim, cfg, int(cfg.pilot_samples_multiple * pop_exp), pilot_dt)
-    tau_int = estimate_autocorrelation_time(pilot_samples, max_lag=cfg.pilot_max_lag)
+    pilot_n, _ = collect_samples_time(
+        sim, cfg, int(cfg.pilot_samples_multiple * pop_exp), pilot_dt
+    )
+    tau_int = estimate_autocorrelation_time(pilot_n, max_lag=cfg.pilot_max_lag)
     window_size = max(cfg.min_batch_size, int(math.ceil(cfg.batch_tau_multiple * tau_int)))
 
-    # --- Фаза 3: проверяем стабильность двух последовательных окон ---
+    # --- Фаза 3: стационар <=> среднее Z совместимо с нулём ---
+    # Окна длиной >> τ_int => оконные средние z̄_w практически независимы.
+    # Принимаем стационар, когда одновременно:
+    #   (а) |t| = |mean(z̄_w)| / (std(z̄_w)/sqrt(W)) <= warmup_z_tcrit
+    #   (б) SE(z̄) <= warmup_z_resolution * b * n̂   — иначе тест просто слеп
+    #   (в) (а) и (б) держатся warmup_min_stable_windows проверок подряд
+    warmup_z_windows = cfg.warmup_z_windows
+    z_buf: list[float] = []
+    n_buf: list[float] = []
     stable_count = 0
     stability_windows = 0
-    prev_mean = float(pilot_samples.mean())
+    z_mean = z_se = z_t = np.nan
 
     while True:
         if time.perf_counter() - warmup_start > cfg.max_warmup_wall_seconds:
-            return {
-                "warmup_time_wall": time.perf_counter() - warmup_start,
-                "warmup_reached_target": False,
-                "warmup_phase1_chunks": phase1_chunks,
-                "warmup_tau_int": tau_int,
-                "warmup_window_size": window_size,
-                "warmup_stability_windows": stability_windows,
-                "warmup_stable_count": stable_count,
-            }
+            return _return(phase1_chunks, tau_int, window_size,
+                         stability_windows, stable_count, z_mean, z_se, z_t)
 
-        window_samples = collect_density_samples_time(sim, cfg, window_size, pilot_dt)
-        curr_mean = float(window_samples.mean())
+        win_n, win_z = collect_samples_time(sim, cfg, window_size, pilot_dt)
+        z_buf.append(float(win_z.mean()))
+        n_buf.append(float(win_n.mean()))
+        if len(z_buf) > warmup_z_windows:
+            z_buf.pop(0)
+            n_buf.pop(0)
         stability_windows += 1
 
-        if prev_mean > 0 and abs(curr_mean - prev_mean) / prev_mean < cfg.warmup_stability_tol:
+        if len(z_buf) < warmup_z_windows:
+            continue
+
+        zb = np.asarray(z_buf)
+        n_mean = float(np.mean(n_buf))
+        z_mean = float(zb.mean())
+        z_se = float(zb.std(ddof=1) / math.sqrt(warmup_z_windows))
+        z_t = z_mean / z_se if z_se > 0.0 else np.inf
+
+        rate_scale = cfg.b * n_mean          # естественный масштаб скорости
+        resolved = z_se <= cfg.warmup_z_resolution * rate_scale and rate_scale > 0.0
+        centered = abs(z_t) <= cfg.warmup_z_tcrit
+
+        if resolved and centered:
             stable_count += 1
         else:
             stable_count = 0
 
-        prev_mean = curr_mean
-
         if stable_count >= cfg.warmup_min_stable_windows:
-            return {
-                "warmup_time_wall": time.perf_counter() - warmup_start,
-                "warmup_reached_target": True,
-                "warmup_phase1_chunks": phase1_chunks,
-                "warmup_tau_int": tau_int,
-                "warmup_window_size": window_size,
-                "warmup_stability_windows": stability_windows,
-                "warmup_stable_count": stable_count,
-            }
+            return _return(phase1_chunks, tau_int, window_size,
+                         stability_windows, stable_count, z_mean, z_se, z_t, flag=True)
 
 
-def collect_density_samples_time(
+def collect_samples_time(
     sim: SSAState1D,
     cfg: ExperimentConfig,
     n_samples: int,
     dt_sample: float,
-) -> NDArray[np.float64]:
-    samples = np.empty(n_samples, dtype=np.float64)
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """
+    Возвращает (n_samples_arr, z_samples_arr), оба на единицу длины:
+        n = N / L
+        z = (b*N - D) / L,   D = sim.total_death_rate
+
+    E[z] = 0 точно в стационаре (генератор, применённый к f = N).
+    b*N считаем как cfg.b * N (не через sim.total_birth_rate), чтобы не тащить
+    накопленный FP-дрейф инкрементальных агрегатов.
+    """
+    n_arr = np.empty(n_samples, dtype=np.float64)
+    z_arr = np.empty(n_samples, dtype=np.float64)
     for i in range(n_samples):
         sim.run_until_time(dt_sample)
-        samples[i] = sim.current_population() / cfg.L
-    return samples
+        pop = sim.current_population()
+        n_arr[i] = pop / cfg.L
+        z_arr[i] = (cfg.b * pop - sim.total_death_rate) / cfg.L
+    return n_arr, z_arr
 
 
 # =============================================================================
@@ -313,6 +419,18 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
         "density_half_width": np.nan,
         "density_ci_lower": np.nan,
         "density_ci_upper": np.nan,
+        "cv_density_mean": np.nan,
+        "cv_density_mean_se": np.nan,
+        "cv_density_half_width": np.nan,
+        "cv_density_ci_lower": np.nan,
+        "cv_density_ci_upper": np.nan,
+        "c_hat_full": np.nan,
+        "corr_batch": np.nan,
+        "corr_sample": np.nan,
+        "var_reduction": np.nan,
+        "z_mean": np.nan,
+        "z_mean_se": np.nan,
+        "z_tstat": np.nan,
         "tau_int": np.nan,
         "batch_size": 0,
         "batches_used": 0,
@@ -329,6 +447,9 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
         "warmup_window_size": 0,
         "warmup_stability_windows": 0,
         "warmup_stable_count": 0,
+        "warmup_z_mean_final": np.nan,
+        "warmup_z_se_final": np.nan,
+        "warmup_z_tstat_final": np.nan,
     }
 
     if not np.isfinite(n_exp) or pop_exp < 10:
@@ -372,6 +493,9 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
             "warmup_window_size": warmup_res["warmup_window_size"],
             "warmup_stability_windows": warmup_res["warmup_stability_windows"],
             "warmup_stable_count": warmup_res["warmup_stable_count"],
+            "warmup_z_mean_final": warmup_res["warmup_z_mean_final"],
+            "warmup_z_se_final": warmup_res["warmup_z_se_final"],
+            "warmup_z_tstat_final": warmup_res["warmup_z_tstat_final"],
         }
     )
     if not warmup_res["warmup_reached_target"]:
@@ -379,40 +503,54 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
 
     measurement_start_wall = time.perf_counter()
 
-    sample_dt = cfg.event_frac / (2.0 * cfg.b) # стационарное состояние: d + d'n ~ b -> с частицей происходит что-то раз в 2b времени
+    sample_dt = cfg.event_frac / (2.0 * cfg.b)
 
-    pilot_samples = collect_density_samples_time(sim, cfg, int(cfg.pilot_samples_multiple * pop_exp), sample_dt)
-    tau_int = estimate_autocorrelation_time(pilot_samples, max_lag=cfg.pilot_max_lag)
+    pilot_n, pilot_z = collect_samples_time(
+        sim, cfg, int(cfg.pilot_samples_multiple * pop_exp), sample_dt
+    )
+    tau_int = estimate_autocorrelation_time(pilot_n, max_lag=cfg.pilot_max_lag)
+
+    # диагностика: корреляция n и Z на ПОСЭМПЛОВОМ уровне (не влияет на оценку)
+    if pilot_n.var() > 0.0 and pilot_z.var() > 0.0:
+        corr_sample = float(np.corrcoef(pilot_n, pilot_z)[0, 1])
+    else:
+        corr_sample = np.nan
 
     batch_size = max(cfg.min_batch_size, int(math.ceil(cfg.batch_tau_multiple * tau_int)))
 
-    batch_means: list[float] = []
+    n_batch_means: list[float] = []
+    z_batch_means: list[float] = []
     measurement_sim_time = cfg.pilot_samples_multiple * sample_dt
     converged = False
     ci_target = np.inf
     is_strict = False
 
     for _ in range(cfg.max_batches):
-        batch_samples = collect_density_samples_time(sim, cfg, batch_size, sample_dt)
-        batch_means.append(float(batch_samples.mean()))
+        bn, bz = collect_samples_time(sim, cfg, batch_size, sample_dt)
+        n_batch_means.append(float(bn.mean()))
+        z_batch_means.append(float(bz.mean()))
         measurement_sim_time += batch_size * sample_dt
 
-        if len(batch_means) < cfg.min_batches:
+        if len(n_batch_means) < cfg.min_batches:
             continue
 
-        density_mean, _, density_half_width, _, _ = (
-            compute_mean_and_ci_from_batch_means(batch_means, cfg.ci_confidence)
+        cv = compute_cv_estimate(
+            np.asarray(n_batch_means), np.asarray(z_batch_means), cfg.ci_confidence
         )
-
-        ci_target, is_strict = compute_ci_target(cfg, density_mean, n_exp)
-        converged = density_half_width <= ci_target
+        # остановка теперь по CV-оценке
+        ci_target, is_strict = compute_ci_target(cfg, cv["cv_mean"], n_exp)
+        converged = cv["cv_half_width"] <= ci_target
         if converged:
             break
 
     measurement_time_wall = time.perf_counter() - measurement_start_wall
 
+    # наивная оценка — baseline для сравнения (в остановке не участвует)
     density_mean, density_mean_se, density_half_width, density_lo, density_hi = (
-        compute_mean_and_ci_from_batch_means(batch_means, cfg.ci_confidence)
+        compute_mean_and_ci_from_batch_means(n_batch_means, cfg.ci_confidence)
+    )
+    cv = compute_cv_estimate(
+        np.asarray(n_batch_means), np.asarray(z_batch_means), cfg.ci_confidence
     )
 
     res.update(
@@ -422,9 +560,21 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
             "density_half_width": density_half_width,
             "density_ci_lower": density_lo,
             "density_ci_upper": density_hi,
+            "cv_density_mean": cv["cv_mean"],
+            "cv_density_mean_se": cv["cv_se"],
+            "cv_density_half_width": cv["cv_half_width"],
+            "cv_density_ci_lower": cv["cv_lo"],
+            "cv_density_ci_upper": cv["cv_hi"],
+            "c_hat_full": cv["c_hat_full"],
+            "corr_batch": cv["corr_batch"],
+            "corr_sample": corr_sample,
+            "var_reduction": cv["var_reduction"],
+            "z_mean": cv["z_mean"],
+            "z_mean_se": cv["z_mean_se"],
+            "z_tstat": cv["z_tstat"],
             "tau_int": tau_int,
             "batch_size": batch_size,
-            "batches_used": len(batch_means),
+            "batches_used": len(n_batch_means),
             "sample_dt": sample_dt,
             "measurement_sim_time": measurement_sim_time,
             "measurement_time_wall": measurement_time_wall,
@@ -488,6 +638,18 @@ def run_sigma_d_prime_grid(cfg: ExperimentConfig) -> list[dict]:
                     "density_half_width": r["density_half_width"],
                     "density_ci_lower": r["density_ci_lower"],
                     "density_ci_upper": r["density_ci_upper"],
+                    "cv_density_mean": r["cv_density_mean"],
+                    "cv_density_mean_se": r["cv_density_mean_se"],
+                    "cv_density_half_width": r["cv_density_half_width"],
+                    "cv_density_ci_lower": r["cv_density_ci_lower"],
+                    "cv_density_ci_upper": r["cv_density_ci_upper"],
+                    "c_hat_full": r["c_hat_full"],
+                    "corr_batch": r["corr_batch"],
+                    "corr_sample": r["corr_sample"],
+                    "var_reduction": r["var_reduction"],
+                    "z_mean": r["z_mean"],
+                    "z_mean_se": r["z_mean_se"],
+                    "z_tstat": r["z_tstat"],
                     "tau_int": r["tau_int"],
                     "batch_size": r["batch_size"],
                     "batches_used": r["batches_used"],
@@ -504,6 +666,9 @@ def run_sigma_d_prime_grid(cfg: ExperimentConfig) -> list[dict]:
                     "warmup_window_size": r["warmup_window_size"],
                     "warmup_stability_windows": r["warmup_stability_windows"],
                     "warmup_stable_count": r["warmup_stable_count"],
+                    "warmup_z_mean_final": r["warmup_z_mean_final"],
+                    "warmup_z_se_final": r["warmup_z_se_final"],
+                    "warmup_z_tstat_final": r["warmup_z_tstat_final"],
                 }
             )
 
