@@ -44,7 +44,6 @@ class ExperimentConfig:
     # Warmup
     initial_density_frac: float = 0.1
     warmup_threshold_frac: float = 0.50        # ждём 50% от pop_exp перед Z-тестом
-    warmup_min_stable_windows: int = 10        # 10 пройденных проверок подряд
     warmup_event_chunk: int = 5000
     max_warmup_batches: int = 10000
 
@@ -55,13 +54,15 @@ class ExperimentConfig:
 
     # Измерения по физическому времени
     event_frac: float = 0.10
-    min_events_per_sample: int = 10
 
     # Pilot / batch means
     pilot_samples_multiple: int = 10
     pilot_max_lag: int = 80
     batch_tau_multiple: float = 10.0
     min_batch_size: int = 50
+
+    # Измерение c
+    calibration_batches: int = 30   
 
     # Адаптивная остановка
     min_batches: int = 50
@@ -174,6 +175,27 @@ def t_quantile(confidence: float, df: int) -> float:
         return float("inf")
     return float(student_t.ppf(0.5 * (1.0 + confidence), df))
 
+def estimate_cv_coefficient(
+    n_means: NDArray[np.float64], z_means: NDArray[np.float64]
+) -> float:
+    """
+    Наклон регрессии n̄ на z̄ по КАЛИБРОВОЧНЫМ батчам: c = Cov(n̄, z̄) / Var(z̄).
+ 
+    Оценивается по данным, независимым от измерительных батчей, и далее фиксируется.
+    Несмещённость n̂_CV верна при ЛЮБОМ константном c, поскольку E[z̄_j] = 0
+    в стационаре; точность c влияет только на величину снижения дисперсии
+    (раздутие ~ 1 + 1/calib_batches). При Var(z̄) = 0 возвращается 0.0 —
+    CV-оценка вырождается в наивную, что безопасно.
+    """
+    n = np.asarray(n_means, dtype=np.float64)
+    z = np.asarray(z_means, dtype=np.float64)
+    if n.size < 3:
+        return 0.0
+    var_z = float(z.var(ddof=1))
+    if not np.isfinite(var_z) or var_z <= 0.0:
+        return 0.0
+    c = float(np.cov(n, z, ddof=1)[0, 1] / var_z)
+    return c if np.isfinite(c) else 0.0
 
 def compute_mean_and_ci_from_batch_means(
     batch_means: list[float], confidence: float
@@ -208,62 +230,56 @@ def compute_cv_estimate(
     n_means: NDArray[np.float64],
     z_means: NDArray[np.float64],
     confidence: float,
+    c_fixed: float,
 ) -> dict:
     """
-    n̂_CV = (1/m) * Σ_j ( n̄_j - ĉ^(-j) * z̄_j ),
-
-        ĉ^(-j) = Σ_{i≠j} (n̄_i - n̄̄^(-j))(z̄_i - z̄̄^(-j)) / Σ_{i≠j} (z̄_i - z̄̄^(-j))^2
-
-    ĉ^(-j) не использует батч j, поэтому E[ĉ^(-j) * z̄_j] = ĉ^(-j) * E[z̄_j] = 0
-    (батчи длиной >> τ_int практически независимы) — смещения нет.
-
-    CI строится по g_j = n̄_j - ĉ^(-j) * z̄_j как по iid-выборке.
-    Реализация O(m) через полные суммы, а не O(m^2).
+    n̂_CV = (1/m) * Σ_j g_j,   g_j = n̄_j - c * z̄_j,   где c — КОНСТАНТА.
+ 
+    c оценён заранее по независимому калибровочному блоку (estimate_cv_coefficient)
+    и здесь не пересчитывается. Отсюда два свойства:
+ 
+      * смещения нет при любом c: E[g_j] = E[n̄_j] - c * E[z̄_j] = N,
+        поскольку в стационаре E[z̄_j] = 0;
+      * g_j независимы между собой (батчи независимы, а c не является функцией
+        данных измерения), поэтому SE = s_g / √m законна, а df = m - 1.
+ 
+    Прежняя версия оценивала c leave-one-out по самим измерительным батчам.
+    Это тоже убирало смещение, но делало g_j взаимно зависимыми через общий c,
+    из-за чего SE была занижена на O(1/m) и требовала df = m - 2.
     """
     n = np.asarray(n_means, dtype=np.float64)
     z = np.asarray(z_means, dtype=np.float64)
     m = n.size
-
+ 
     out = {
         "cv_mean": np.nan, "cv_se": np.nan, "cv_half_width": np.inf,
         "cv_lower": -np.inf, "cv_upper": np.inf,
+        "c_used": float(c_fixed),
         "c_full": np.nan, "corr_batch": np.nan, "var_reduction": np.nan,
         "z_mean": np.nan, "z_mean_se": np.nan, "z_tstat": np.nan,
     }
-    if m < 3:
+    if m < 2:
         return out
-
-    Sn = n.sum()
-    Sz = z.sum()
-    Szz = float(z @ z)
-    Snz = float(n @ z)
-
-    m1 = m - 1
-    sn = Sn - n            # суммы без батча j
-    sz = Sz - z
-    nbar = sn / m1
-    zbar = sz / m1
-    Sxy = (Snz - n * z) - m1 * nbar * zbar
-    Sxx = (Szz - z * z) - m1 * zbar * zbar
-
-    c_loo = np.where(Sxx > 0.0, Sxy / np.where(Sxx > 0.0, Sxx, 1.0), 0.0)
-    g = n - c_loo * z
-
+ 
+    g = n - c_fixed * z
+ 
     cv_mean = float(g.mean())
     cv_se = float(g.std(ddof=1) / math.sqrt(m))
-    cv_hw = t_quantile(confidence, m - 2) * cv_se
-
-    # --- диагностика ---
+    cv_hw = t_quantile(confidence, m - 1) * cv_se
+ 
+    # --- диагностика (в саму оценку НЕ входит) ---
     var_z = float(z.var(ddof=1))
     var_n = float(n.var(ddof=1))
+    # c_full — апостериорно оптимальный наклон по измерительным батчам.
+    # Служит проверкой качества калибровки: c_used должен быть близок к c_full.
     c_full = float(np.cov(n, z, ddof=1)[0, 1] / var_z) if var_z > 0.0 else np.nan
     corr_b = float(np.corrcoef(n, z)[0, 1]) if var_z > 0.0 and var_n > 0.0 else np.nan
     var_red = float(g.var(ddof=1) / var_n) if var_n > 0.0 else np.nan
-
+ 
     z_mean = float(z.mean())
     z_se = float(z.std(ddof=1) / math.sqrt(m))
     z_t = z_mean / z_se if z_se > 0.0 else np.nan
-
+ 
     out.update({
         "cv_mean": cv_mean, "cv_se": cv_se, "cv_half_width": cv_hw,
         "cv_lower": cv_mean - cv_hw, "cv_upper": cv_mean + cv_hw,
@@ -446,6 +462,8 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
         "cv_density_half_width": np.nan,
         "cv_density_ci_lower": np.nan,
         "cv_density_ci_upper": np.nan,
+        "c_used": np.nan,
+        "calib_batches": 0,
         "c_full": np.nan,
         "corr_batch": np.nan,
         "corr_sample": np.nan,
@@ -538,9 +556,22 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
 
     batch_size = max(cfg.min_batch_size, int(math.ceil(cfg.batch_tau_multiple * tau_int)))
 
+        # --- Калибровочный блок: оценка c по НЕЗАВИСИМЫМ батчам ---------------------
+    # Эти батчи идут ТОЛЬКО на оценку c и выбрасываются из измерения. Благодаря
+    # этому в измерении c — константа, а не функция измерительных данных, поэтому
+    # g_j = n̄_j - c*z̄_j строго iid и формула s_g/√m применима без оговорок.
+    calib_n: list[float] = []
+    calib_z: list[float] = []
+    for _ in range(cfg.calibration_batches):
+        cn, cz = collect_samples_time(sim, cfg, batch_size, sample_dt)
+        calib_n.append(float(cn.mean()))
+        calib_z.append(float(cz.mean()))
+    c_used = estimate_cv_coefficient(np.asarray(calib_n), np.asarray(calib_z))
+    calibration_sim_time = cfg.calibration_batches * batch_size * sample_dt
+
     n_batch_means: list[float] = []
     z_batch_means: list[float] = []
-    measurement_sim_time = cfg.pilot_samples_multiple * sample_dt
+    measurement_sim_time = int(cfg.pilot_samples_multiple * pop_exp) * sample_dt + calibration_sim_time
     converged = False
     ci_target = np.inf
     is_strict = False
@@ -554,9 +585,7 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
         if len(n_batch_means) < cfg.min_batches:
             continue
 
-        cv = compute_cv_estimate(
-            np.asarray(n_batch_means), np.asarray(z_batch_means), cfg.ci_confidence
-        )
+        cv = compute_cv_estimate(np.asarray(n_batch_means), np.asarray(z_batch_means), cfg.ci_confidence, c_used)
         # остановка теперь по CV-оценке
         ci_target, is_strict = compute_ci_target(cfg, cv["cv_mean"], n_exp)
         converged = cv["cv_half_width"] <= ci_target
@@ -567,7 +596,7 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
 
     # наивная оценка — baseline для сравнения (в остановке не участвует)
     n = compute_mean_and_ci_from_batch_means(n_batch_means, cfg.ci_confidence)
-    cv = compute_cv_estimate(np.asarray(n_batch_means), np.asarray(z_batch_means), cfg.ci_confidence)
+    cv = compute_cv_estimate(np.asarray(n_batch_means), np.asarray(z_batch_means), cfg.ci_confidence, c_used)
 
     res.update(
         {
@@ -581,6 +610,8 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
             "cv_density_half_width": cv["cv_half_width"],
             "cv_density_ci_lower": cv["cv_lower"],
             "cv_density_ci_upper": cv["cv_upper"],
+            "c_used": cv["c_used"],
+            "calib_batches": cfg.calibration_batches,
             "c_full": cv["c_full"],
             "corr_batch": cv["corr_batch"],
             "corr_sample": corr_sample,
@@ -659,6 +690,8 @@ def run_sigma_d_prime_grid(cfg: ExperimentConfig) -> list[dict]:
                     "cv_density_half_width": r["cv_density_half_width"],
                     "cv_density_ci_lower": r["cv_density_ci_lower"],
                     "cv_density_ci_upper": r["cv_density_ci_upper"],
+                    "c_used": r["c_used"],
+                    "calib_batches": r["calib_batches"],
                     "c_full": r["c_full"],
                     "corr_batch": r["corr_batch"],
                     "corr_sample": r["corr_sample"],
