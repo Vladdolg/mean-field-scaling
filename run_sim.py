@@ -6,8 +6,7 @@ import time
 from dataclasses import dataclass, replace
 from itertools import product
 from pathlib import Path
-from statistics import NormalDist
-from scipy.stats import halfnorm
+from scipy.stats import halfnorm, t as student_t
 
 import numpy as np
 from joblib import Parallel, delayed
@@ -51,6 +50,7 @@ class ExperimentConfig:
 
     # Warmup: критерий стационарности через тест ЭКВИВАЛЕНТНОСТИ E[Z] ≈ 0
     warmup_z_min_windows: int = 10          # минимум накопленных окон перед проверкой
+    warmup_z_confidence: float = 0.95
     warmup_z_resolution: float = 1e-3   # δ = res * b * n̂  — граница допуска на дрейф
 
     # Измерения по физическому времени
@@ -64,7 +64,7 @@ class ExperimentConfig:
     min_batch_size: int = 50
 
     # Адаптивная остановка
-    min_batches: int = 20
+    min_batches: int = 50
     max_batches: int = 100000
     ci_confidence: float = 0.95
 
@@ -164,6 +164,16 @@ def estimate_autocorrelation_time(samples: NDArray[np.float64], max_lag: int = 1
 
     return max(1.0, tau)
 
+def t_quantile(confidence: float, df: int) -> float:
+    """
+    Двусторонний квантиль Стьюдента t_{(1+confidence)/2, df}.
+    Используется вместо нормального, потому что дисперсия оценивается
+    по той же выборке. df < 1 -> интервал не определён.
+    """
+    if df < 1:
+        return float("inf")
+    return float(student_t.ppf(0.5 * (1.0 + confidence), df))
+
 
 def compute_mean_and_ci_from_batch_means(
     batch_means: list[float], confidence: float
@@ -184,8 +194,7 @@ def compute_mean_and_ci_from_batch_means(
         return out
     
     se = float(arr.std(ddof=1) / math.sqrt(arr.size))
-    alpha = 1.0 - confidence
-    half_width = float(NormalDist().inv_cdf(1.0 - alpha / 2.0)) * se
+    half_width = t_quantile(confidence, arr.size - 1) * se
     
     out.update({ 
         "density_mean_se": se,
@@ -242,9 +251,7 @@ def compute_cv_estimate(
 
     cv_mean = float(g.mean())
     cv_se = float(g.std(ddof=1) / math.sqrt(m))
-    alpha = 1.0 - confidence
-    zq = float(NormalDist().inv_cdf(1.0 - alpha / 2.0))
-    cv_hw = zq * cv_se
+    cv_hw = t_quantile(confidence, m - 2) * cv_se
 
     # --- диагностика ---
     var_z = float(z.var(ddof=1))
@@ -386,7 +393,7 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
 
         n_hat = Sn / stability_windows
         delta = cfg.warmup_z_resolution * cfg.b * n_hat
-        margin = abs(z_mean) + float(NormalDist().inv_cdf(0.975)) * z_se
+        margin = abs(z_mean) + t_quantile(cfg.warmup_z_confidence, stability_windows - 1) * z_se
 
         if delta > 0.0 and margin <= delta:
             return _return(phase1_chunks, tau_int, window_size,
