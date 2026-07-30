@@ -56,7 +56,7 @@ class ExperimentConfig:
     event_frac: float = 0.10
 
     # Pilot / batch means
-    pilot_samples_multiple: int = 10
+    pilot_samples_multiple: int = 100
     sokal_multiple: float = 20.0
     batch_tau_multiple: float = 10.0
     min_batch_size: int = 50
@@ -173,7 +173,7 @@ def batch_means_lag1(batch_means):
     if denom <= 0.0:
         return 0.0, True
     rho1 = float(np.dot(x[:-1], x[1:]) / denom)
-    return rho1, abs(rho1) <= 2.0 / np.sqrt(m)
+    return rho1, abs(rho1) <= 0.1
 
 def t_quantile(confidence: float, df: int) -> float:
     """
