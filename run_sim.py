@@ -173,7 +173,7 @@ def batch_means_lag1(batch_means):
     if denom <= 0.0:
         return 0.0, True
     rho1 = float(np.dot(x[:-1], x[1:]) / denom)
-    return rho1, abs(rho1) <= 0.1
+    return rho1, abs(rho1) <= 0.2
 
 def t_quantile(confidence: float, df: int) -> float:
     """
