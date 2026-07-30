@@ -60,6 +60,7 @@ class ExperimentConfig:
     sokal_multiple: float = 20.0
     batch_tau_multiple: float = 10.0
     min_batch_size: int = 50
+    acceptable_lag1_rho: float = 0.2
 
     # Измерение c
     calibration_batches: int = 30   
@@ -173,7 +174,7 @@ def batch_means_lag1(batch_means):
     if denom <= 0.0:
         return 0.0, True
     rho1 = float(np.dot(x[:-1], x[1:]) / denom)
-    return rho1, abs(rho1) <= 0.2
+    return rho1
 
 def t_quantile(confidence: float, df: int) -> float:
     """
@@ -612,7 +613,7 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
     n = compute_mean_and_ci_from_batch_means(n_batch_means, cfg.ci_confidence)
     cv = compute_cv_estimate(np.asarray(n_batch_means), np.asarray(z_batch_means), cfg.ci_confidence, c_used)
 
-    rho1, batch_lag1_ok = batch_means_lag1(np.asarray(n_batch_means) - c_used * np.asarray(z_batch_means))
+    rho1 = batch_means_lag1(np.asarray(n_batch_means) - c_used * np.asarray(z_batch_means))
 
     res.update(
         {
@@ -637,7 +638,7 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
             "z_tstat": cv["z_tstat"],
             "tau_int": tau_int,
             "batch_lag1_rho": rho1,
-            "batch_lag1_ok": batch_lag1_ok,
+            "batch_lag1_ok": abs(rho1) <= cfg.acceptable_lag1_rho,
             "tau_n_over_w": tau_n_over_w,
             "batch_size": batch_size,
             "batches_used": len(n_batch_means),
