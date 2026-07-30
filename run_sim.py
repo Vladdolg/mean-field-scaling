@@ -57,7 +57,7 @@ class ExperimentConfig:
 
     # Pilot / batch means
     pilot_samples_multiple: int = 10
-    pilot_max_lag: int = 80
+    sokal_multiple: float = 20.0
     batch_tau_multiple: float = 10.0
     min_batch_size: int = 50
 
@@ -140,30 +140,40 @@ def make_gaussian_tables_1d(
 # =============================================================================
 # Вспомогательная статистика
 # =============================================================================
-def estimate_autocorrelation_time(samples: NDArray[np.float64], max_lag: int = 100) -> float:
-    samples = np.asarray(samples)
-    n = len(samples)
-    max_lag = min(max_lag, n // 2)
-    if max_lag < 2:
-        return 1.0
+def estimate_autocorrelation_time(samples, c: float = 20.0) -> tuple[float, int]:
+    x = np.asarray(samples, dtype=np.float64)
+    n = x.size
+    if n < 8:
+        return 1.0, 1
 
-    mean = samples.mean()
-    var = samples.var()
-    if var < 1e-12:
-        return 1.0
-
-    autocorr = np.zeros(max_lag)
-    for lag in range(max_lag):
-        c = np.mean((samples[: n - lag] - mean) * (samples[lag:] - mean))
-        autocorr[lag] = c / var
+    x = x - x.mean()
+    nfft = 1 << (int(np.ceil(np.log2(n))) + 1)
+    spec = np.fft.rfft(x, nfft)
+    acov = np.fft.irfft(spec * np.conj(spec), nfft)[:n].real / n
+    if not np.isfinite(acov[0]) or acov[0] <= 0.0:
+        return 1.0, 1
+    rho = acov / acov[0]
 
     tau = 1.0
-    for k in range(1, max_lag):
-        if autocorr[k] < 0.05:
+    window = n // 2                 # окно не найдено -> n/W = 2, флаг сам покажет
+    for k in range(1, n // 2):
+        tau += 2.0 * rho[k]
+        if k >= c * tau:
+            window = k
             break
-        tau += 2.0 * autocorr[k]
+    return max(1.0, float(tau)), window
 
-    return max(1.0, tau)
+def batch_means_lag1(batch_means):
+    x = np.asarray(batch_means, dtype=np.float64)
+    m = x.size
+    if m < 8:
+        return float("nan"), False
+    x = x - x.mean()
+    denom = float(np.dot(x, x))
+    if denom <= 0.0:
+        return 0.0, True
+    rho1 = float(np.dot(x[:-1], x[1:]) / denom)
+    return rho1, abs(rho1) <= 2.0 / np.sqrt(m)
 
 def t_quantile(confidence: float, df: int) -> float:
     """
@@ -362,7 +372,7 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
     pilot_n, _ = collect_samples_time(
         sim, cfg, int(cfg.pilot_samples_multiple * pop_exp), pilot_dt
     )
-    tau_int = estimate_autocorrelation_time(pilot_n, max_lag=cfg.pilot_max_lag)
+    tau_int, _ = estimate_autocorrelation_time(pilot_n, c=cfg.sokal_multiple)
     window_size = max(cfg.min_batch_size, int(math.ceil(cfg.batch_tau_multiple * tau_int)))
 
     # --- Фаза 3: тест эквивалентности E[Z] ≈ 0 с НАКОПЛЕНИЕМ ---
@@ -472,6 +482,9 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
         "z_mean_se": np.nan,
         "z_tstat": np.nan,
         "tau_int": np.nan,
+        "batch_lag1_rho": np.nan,
+        "batch_lag1_ok": False,
+        "tau_n_over_w": np.nan,
         "batch_size": 0,
         "batches_used": 0,
         "sample_dt": np.nan,
@@ -546,7 +559,8 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
     pilot_n, pilot_z = collect_samples_time(
         sim, cfg, int(cfg.pilot_samples_multiple * pop_exp), sample_dt
     )
-    tau_int = estimate_autocorrelation_time(pilot_n, max_lag=cfg.pilot_max_lag)
+    tau_int, window = estimate_autocorrelation_time(pilot_n, c=cfg.sokal_multiple)
+    tau_n_over_w = len(pilot_n) / window
 
     # диагностика: корреляция n и Z на ПОСЭМПЛОВОМ уровне (не влияет на оценку)
     if pilot_n.var() > 0.0 and pilot_z.var() > 0.0:
@@ -598,6 +612,8 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
     n = compute_mean_and_ci_from_batch_means(n_batch_means, cfg.ci_confidence)
     cv = compute_cv_estimate(np.asarray(n_batch_means), np.asarray(z_batch_means), cfg.ci_confidence, c_used)
 
+    rho1, batch_lag1_ok = batch_means_lag1(np.asarray(n_batch_means) - c_used * np.asarray(z_batch_means))
+
     res.update(
         {
             "density_mean": n["density_mean"],
@@ -620,6 +636,9 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
             "z_mean_se": cv["z_mean_se"],
             "z_tstat": cv["z_tstat"],
             "tau_int": tau_int,
+            "batch_lag1_rho": rho1,
+            "batch_lag1_ok": batch_lag1_ok,
+            "tau_n_over_w": tau_n_over_w,
             "batch_size": batch_size,
             "batches_used": len(n_batch_means),
             "sample_dt": sample_dt,
@@ -700,6 +719,9 @@ def run_sigma_d_prime_grid(cfg: ExperimentConfig) -> list[dict]:
                     "z_mean_se": r["z_mean_se"],
                     "z_tstat": r["z_tstat"],
                     "tau_int": r["tau_int"],
+                    "batch_lag1_rho": r["batch_lag1_rho"],
+                    "batch_lag1_ok": r["batch_lag1_ok"],
+                    "tau_n_over_w": r["tau_n_over_w"],
                     "batch_size": r["batch_size"],
                     "batches_used": r["batches_used"],
                     "sample_dt": r["sample_dt"],
