@@ -57,8 +57,12 @@ class ExperimentConfig:
     event_frac: float = 0.10
 
     # Pilot / batch means
-    pilot_samples_multiple: int = 100
     sokal_multiple: float = 20.0
+    pilot_target_ratio: float = 50.0     # требуемое N/window (бывшее tau_n_over_w)
+    pilot_chunk_samples: int = 20000     # стартовый чанк
+    pilot_max_doublings: int = 6         # потолок числа итераций
+    pilot_size_safety: float = 1.3       # запас при прыжке к целевому размеру
+
     batch_tau_multiple: float = 10.0
     min_batch_size: int = 50
 
@@ -164,15 +168,83 @@ def estimate_autocorrelation_time(samples, c: float = 20.0) -> tuple[float, int]
             break
     return max(1.0, float(tau)), window
 
+def estimate_tau_adaptive(
+    sim: SSAState1D,
+    cfg: ExperimentConfig,
+    dt_sample: float,
+) -> dict:
+    """
+    Адаптивная оценка τ_int вместо фиксированных pilot_samples_multiple * pop_exp.
+
+    Требуемая длина ряда пропорциональна САМОМУ τ_int, а не размеру популяции:
+    окно Сокола W ≈ sokal_multiple * τ_int, а качество оценки задаётся отношением
+    N/W. Привязка к pop_exp с этим не связана: в тестах она дала N/W = 66 при
+    d = 0.01 и 35 при d = 0.1 (ниже стандарта), а при d' = 0.1 заложила бы
+    ~10^6 сэмплов при потребности на порядок меньшей.
+
+    Схема: набрать чанк, оценить τ и окно, проверить N/W >= pilot_target_ratio.
+    Если мало — набрать НОВЫЙ чанк размера max(2*текущий, safety*ratio*W) и
+    оценить заново. Прыжок сразу к нужному размеру экономит итерации против
+    слепого удвоения; множитель 2 остаётся нижней границей на случай, если τ
+    был занижен.
+
+    Оценка КАЖДЫЙ РАЗ идёт только по последнему чанку:
+      * в фазе 2 ранние сэмплы сняты с ещё неравновесной системы и завышают τ
+        (в тестах 155 против 74 и 258 против 128);
+      * при коротком ряде окно Сокола не находится, estimate_autocorrelation_time
+        возвращает window = n//2, то есть ratio = 2, критерий не проходит и
+        происходит добор. Ошибка «мало данных» самокорректируется.
+
+    Цена tail-only — ранние чанки выбрасываются; при прыжке к цели это обычно
+    один стартовый чанк, то есть накладные ~ pilot_chunk_samples.
+    """
+    n_target = int(cfg.pilot_chunk_samples)
+    total_samples = 0
+    iterations = 0
+    tau_int = np.nan
+    window = 0
+    ratio = np.nan
+    ok = False
+    chunk_n = np.empty(0, dtype=np.float64)
+    chunk_z = np.empty(0, dtype=np.float64)
+
+    for _ in range(cfg.pilot_max_doublings + 1):
+        chunk_n, chunk_z = collect_samples_time(sim, cfg, n_target, dt_sample)
+        total_samples += n_target
+        iterations += 1
+
+        tau_int, window = estimate_autocorrelation_time(chunk_n, c=cfg.sokal_multiple)
+        window = max(1, int(window))
+        ratio = chunk_n.size / window
+
+        if ratio >= cfg.pilot_target_ratio:
+            ok = True
+            break
+
+        need = int(math.ceil(cfg.pilot_size_safety * cfg.pilot_target_ratio * window))
+        n_target = max(2 * n_target, need)
+
+    return {
+        "tau_int": float(tau_int),
+        "window": window,
+        "ratio": float(ratio),
+        "n_chunk": int(chunk_n.size),
+        "n_total": int(total_samples),
+        "iterations": iterations,
+        "converged": ok,
+        "pilot_n": chunk_n,
+        "pilot_z": chunk_z,
+    }
+
 def batch_means_lag1(batch_means):
     x = np.asarray(batch_means, dtype=np.float64)
     m = x.size
     if m < 8:
-        return float("nan"), False
+        return float("nan")
     x = x - x.mean()
     denom = float(np.dot(x, x))
     if denom <= 0.0:
-        return 0.0, True
+        return 0.0
     rho1 = float(np.dot(x[:-1], x[1:]) / denom)
     return rho1
 
@@ -343,6 +415,7 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
     threshold_pop = cfg.warmup_threshold_frac * pop_exp
 
     def _return(phase1_chunks, tau_int, window_size, stability_windows,
+                tau_n_over_w=np.nan, pilot_samples=np.nan, pilot_iterations=np.nan, pilot_converged=np.nan,
                 z_mean=np.nan, z_se=np.nan, z_t=np.nan,
                 A_est=np.nan, k_min=np.nan, flag=False):
         return {
@@ -350,6 +423,10 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
             "warmup_reached_target": flag,
             "warmup_phase1_chunks": phase1_chunks,
             "warmup_tau_int": tau_int,
+            "warmup_tau_n_over_w": tau_n_over_w,
+            "warmup_pilot_samples": pilot_samples, 
+            "warmup_pilot_iterations": pilot_iterations, 
+            "warmup_pilot_converged": pilot_converged,
             "warmup_window_size": window_size,
             "warmup_stability_windows": stability_windows,
             "warmup_z_mean_final": z_mean,
@@ -365,7 +442,7 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
     phase1_chunks = 0
     while sim.current_population() < threshold_pop:
         if phase1_chunks > cfg.max_warmup_batches:
-            return _return(phase1_chunks, np.nan, 0, 0, 0)
+            return _return(phase1_chunks, np.nan, 0, 0)
         sim.run_events(cfg.warmup_event_chunk)
         phase1_chunks += 1
         if sim.current_population() <= 0:
@@ -373,14 +450,12 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
 
     # --- Фаза 2: грубая оценка τ_int ---
     pilot_dt = cfg.event_frac / (2.0 * cfg.b)
-    pilot_n, _ = collect_samples_time(
-        sim, cfg, int(cfg.pilot_samples_multiple * pop_exp), pilot_dt
-    )
-    tau_int, _ = estimate_autocorrelation_time(pilot_n, c=cfg.sokal_multiple)
+    wp = estimate_tau_adaptive(sim, cfg, pilot_dt)
+    tau_int = wp["tau_int"]
     window_size = max(cfg.min_batch_size, int(math.ceil(cfg.batch_tau_multiple * tau_int)))
 
     
-# --- Фаза 3: контроль ОСТАТОЧНОГО ДРЕЙФА ---
+    # --- Фаза 3: контроль ОСТАТОЧНОГО ДРЕЙФА ---
     # E[Z] = dE[n]/dt точно (генератор, применённый к N). Поэтому накопленное
     # z̄ за фазу 3 равно полному изменению плотности, делённому на длительность:
     #       z̄ ≈ A / T,   A = |n_eq - n(начало фазы 3)|
@@ -404,12 +479,13 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
     n_hist: list[float] = []
     stability_windows = 0
     z_mean = z_se = z_t = np.nan
-    A_est = k_min = half_diff = half_diff_se = np.nan
+    A_est = k_min = np.nan
 
     while True:
         if stability_windows + phase1_chunks > cfg.max_warmup_batches:
             return _return(phase1_chunks, tau_int, window_size, stability_windows,
-                           z_mean, z_se, z_t, A_est, k_min, half_diff, half_diff_se)
+                           wp["ratio"], wp["n_total"], wp["iterations"], wp["converged"],
+                           z_mean, z_se, z_t, A_est, k_min)
 
         win_n, win_z = collect_samples_time(sim, cfg, window_size, pilot_dt)
         zw = float(win_z.mean())
@@ -443,6 +519,7 @@ def run_warmup(sim: SSAState1D, cfg: ExperimentConfig, pop_exp: int) -> dict:
 
         if (abs(z_mean) <= delta and stability_windows >= cfg.warmup_duration_safety * k_min):
             return _return(phase1_chunks, tau_int, window_size, stability_windows,
+                           wp["ratio"], wp["n_total"], wp["iterations"], wp["converged"],
                            z_mean, z_se, z_t, A_est, k_min, flag=True)
      
 
@@ -503,8 +580,11 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
         "z_mean_se": np.nan,
         "z_tstat": np.nan,
         "tau_int": np.nan,
-        "batch_lag1_rho": np.nan,
         "tau_n_over_w": np.nan,
+        "pilot_samples": np.nan, 
+        "pilot_iterations": np.nan, 
+        "pilot_converged": False,
+        "batch_lag1_rho": np.nan,
         "batch_size": 0,
         "batches_used": 0,
         "sample_dt": np.nan,
@@ -517,6 +597,10 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
         "warmup_time_wall": 0.0,
         "warmup_phase1_chunks": 0,
         "warmup_tau_int": np.nan,
+        "warmup_tau_n_over_w": np.nan,
+        "warmup_pilot_samples": np.nan, 
+        "warmup_pilot_iterations": np.nan, 
+        "warmup_pilot_converged": False,
         "warmup_window_size": 0,
         "warmup_stability_windows": 0,
         "warmup_z_mean_final": np.nan,
@@ -564,13 +648,17 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
             "warmup_time_wall": warmup_res["warmup_time_wall"],
             "warmup_phase1_chunks": warmup_res["warmup_phase1_chunks"],
             "warmup_tau_int": warmup_res["warmup_tau_int"],
+            "warmup_tau_n_over_w": warmup_res["warmup_tau_n_over_w"],
+            "warmup_pilot_samples": warmup_res["warmup_pilot_samples"], 
+            "warmup_pilot_iterations": warmup_res["warmup_pilot_iterations"], 
+            "warmup_pilot_converged": warmup_res["warmup_pilot_converged"],
             "warmup_window_size": warmup_res["warmup_window_size"],
             "warmup_stability_windows": warmup_res["warmup_stability_windows"],
             "warmup_z_mean_final": warmup_res["warmup_z_mean_final"],
             "warmup_z_se_final": warmup_res["warmup_z_se_final"],
             "warmup_z_tstat_final": warmup_res["warmup_z_tstat_final"],
             "warmup_A_est": warmup_res["warmup_A_est"],
-            "warmup_k_min": warmup_res["warmup_A_est"],
+            "warmup_k_min": warmup_res["warmup_k_min"],
         }
     )
     if not warmup_res["warmup_reached_target"]:
@@ -580,11 +668,9 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
 
     sample_dt = cfg.event_frac / (2.0 * cfg.b)
 
-    pilot_n, pilot_z = collect_samples_time(
-        sim, cfg, int(cfg.pilot_samples_multiple * pop_exp), sample_dt
-    )
-    tau_int, window = estimate_autocorrelation_time(pilot_n, c=cfg.sokal_multiple)
-    tau_n_over_w = len(pilot_n) / window
+    mp = estimate_tau_adaptive(sim, cfg, sample_dt)
+    pilot_n, pilot_z = mp["pilot_n"], mp["pilot_z"]
+    tau_int = mp["tau_int"]
 
     # диагностика: корреляция n и Z на ПОСЭМПЛОВОМ уровне (не влияет на оценку)
     if pilot_n.var() > 0.0 and pilot_z.var() > 0.0:
@@ -594,7 +680,7 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
 
     batch_size = max(cfg.min_batch_size, int(math.ceil(cfg.batch_tau_multiple * tau_int)))
 
-        # --- Калибровочный блок: оценка c по НЕЗАВИСИМЫМ батчам ---------------------
+    # --- Калибровочный блок: оценка c по НЕЗАВИСИМЫМ батчам ---------------------
     # Эти батчи идут ТОЛЬКО на оценку c и выбрасываются из измерения. Благодаря
     # этому в измерении c — константа, а не функция измерительных данных, поэтому
     # g_j = n̄_j - c*z̄_j строго iid и формула s_g/√m применима без оговорок.
@@ -609,7 +695,7 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
 
     n_batch_means: list[float] = []
     z_batch_means: list[float] = []
-    measurement_sim_time = int(cfg.pilot_samples_multiple * pop_exp) * sample_dt + calibration_sim_time
+    measurement_sim_time = mp["n_total"] * sample_dt + calibration_sim_time
     converged = False
     ci_target = np.inf
     is_strict = False
@@ -660,8 +746,11 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
             "z_mean_se": cv["z_mean_se"],
             "z_tstat": cv["z_tstat"],
             "tau_int": tau_int,
+            "tau_n_over_w": mp["ratio"],
+            "pilot_samples": mp["n_total"], 
+            "pilot_iterations": mp["iterations"], 
+            "pilot_converged": mp["converged"],
             "batch_lag1_rho": rho1,
-            "tau_n_over_w": tau_n_over_w,
             "batch_size": batch_size,
             "batches_used": len(n_batch_means),
             "sample_dt": sample_dt,
@@ -670,8 +759,6 @@ def run_single_d(d_val: float, cfg: ExperimentConfig, seed: int) -> dict:
             "ci_target": ci_target,
             "is_strict": is_strict,
             "converged": converged,
-            "warmup_A_est": warmup_res["warmup_A_est"],
-            "warmup_k_min": warmup_res["warmup_A_est"],
         }
     )
     return res
@@ -744,8 +831,11 @@ def run_sigma_d_prime_grid(cfg: ExperimentConfig) -> list[dict]:
                     "z_mean_se": r["z_mean_se"],
                     "z_tstat": r["z_tstat"],
                     "tau_int": r["tau_int"],
-                    "batch_lag1_rho": r["batch_lag1_rho"],
                     "tau_n_over_w": r["tau_n_over_w"],
+                    "pilot_samples": r["pilot_samples"], 
+                    "pilot_iterations": r["pilot_iterations"], 
+                    "pilot_converged": r["pilot_converged"],
+                    "batch_lag1_rho": r["batch_lag1_rho"],
                     "batch_size": r["batch_size"],
                     "batches_used": r["batches_used"],
                     "sample_dt": r["sample_dt"],
@@ -758,13 +848,17 @@ def run_sigma_d_prime_grid(cfg: ExperimentConfig) -> list[dict]:
                     "warmup_time_wall": r["warmup_time_wall"],
                     "warmup_phase1_chunks": r["warmup_phase1_chunks"],
                     "warmup_tau_int": r["warmup_tau_int"],
+                    "warmup_tau_n_over_w": r["warmup_tau_n_over_w"],
+                    "warmup_pilot_samples": r["warmup_pilot_samples"], 
+                    "warmup_pilot_iterations": r["warmup_pilot_iterations"], 
+                    "warmup_pilot_converged": r["warmup_pilot_converged"],
                     "warmup_window_size": r["warmup_window_size"],
                     "warmup_stability_windows": r["warmup_stability_windows"],
                     "warmup_z_mean_final": r["warmup_z_mean_final"],
                     "warmup_z_se_final": r["warmup_z_se_final"],
                     "warmup_z_tstat_final": r["warmup_z_tstat_final"],
                     "warmup_A_est": r["warmup_A_est"],
-                    "warmup_k_min": r["warmup_A_est"],
+                    "warmup_k_min": r["warmup_k_min"],
                 }
             )
 
