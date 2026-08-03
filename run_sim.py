@@ -76,8 +76,8 @@ class ExperimentConfig:
 
     # Warmup
     initial_density_frac: float = 0.1
-    warmup_threshold_frac: float = 0.50        # ждём 50% от pop_exp перед Z-тестом
     warmup_event_chunk: int = 5000
+    warmup_chunks: int = 10
     max_warmup_batches: int = 10000
 
     # Warmup: критерий стационарности через тест ЭКВИВАЛЕНТНОСТИ E[Z] ≈ 0
@@ -480,7 +480,6 @@ def run_warmup(
     warmup_start = time.perf_counter()
     initial_pop = max(10, int(cfg.initial_density_frac * pop_exp))
     spawn_uniform(sim, 0, initial_pop, cfg.L, rng)
-    threshold_pop = cfg.warmup_threshold_frac * pop_exp
 
     def _return(phase1_chunks, tau_int, window_size, stability_windows,
                 tau_n_over_w=np.nan, pilot_samples=np.nan, pilot_iterations=np.nan, pilot_converged=np.nan,
@@ -504,11 +503,11 @@ def run_warmup(
             "warmup_k_min": k_min,
         }
 
-    # --- Фаза 1: рост до threshold_frac * pop_exp ---
+    # --- Фаза 1: первоначальный рост смсемы ---
     # Гейт обязателен: при N = 0 имеем Z ≡ 0 тождественно, и Z-тест прошёл бы
     # тривиально на вымершей конфигурации.
     phase1_chunks = 0
-    while sim.current_population() < threshold_pop:
+    while phase1_chunks < cfg.warmup_chunks:
         if phase1_chunks > cfg.max_warmup_batches:
             return _return(phase1_chunks, np.nan, 0, 0)
         sim.run_events(cfg.warmup_event_chunk)
