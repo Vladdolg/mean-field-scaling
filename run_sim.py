@@ -503,13 +503,14 @@ def run_warmup(
             "warmup_k_min": k_min,
         }
 
-    # --- Фаза 1: первоначальный рост смсемы ---
-    # Гейт обязателен: при N = 0 имеем Z ≡ 0 тождественно, и Z-тест прошёл бы
-    # тривиально на вымершей конфигурации.
+    # --- Фаза 1: первоначальный рост системы ---
+    # Длительность фиксирована и не привязана к pop_exp: порог вида
+    # "доля от mean-field популяции" отбирал бы конфигурацию по величине N,
+    # а именно отклонение N от mean field и измеряется. Равновесие обеспечивают
+    # фаза 2 (пилот длиной ~1000 единиц времени при 1/(b-d) ~ 1) и критерий
+    # дрейфа фазы 3; при вымирании n̂ = 0 даёт δ = 0, и warmup честно не сходится.
     phase1_chunks = 0
     while phase1_chunks < cfg.warmup_chunks:
-        if phase1_chunks > cfg.max_warmup_batches:
-            return _return(phase1_chunks, np.nan, 0, 0)
         sim.run_events(cfg.warmup_event_chunk)
         phase1_chunks += 1
         if sim.current_population() <= 0:
