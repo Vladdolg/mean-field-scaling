@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, replace
 from itertools import product
 from pathlib import Path
-from scipy.stats import halfnorm, t as student_t
+from scipy.stats import halfnorm, t as student_t, chi2 as chi2_dist
 
 import numpy as np
 from joblib import Parallel, delayed
@@ -36,22 +36,37 @@ class ExperimentConfig:
     gaussian_cutoff_sigmas: float = 5.0
 
     # --- Адаптивное окно по d внутри каждой пары (sigma, d_prime) -------------
-    # Фаза A (разведка): лестница сверху вниз с единственным критерием
-    #       (rho + SE(rho)) * d <= bias_tol.
-    # Фаза B (производство): рабочие точки внутри найденного окна.
-    # Исход разведки бинарный: окно либо найдено (probe_ok=True), либо нет.
+    # ОДНА фаза. Лестница спускается мелким шагом, и рабочим окном становятся
+    # window_points ПОСЛЕДНИХ измеренных ступеней — тех же самых, по которым
+    # принято решение об остановке. Отдельной фазы производства нет: раньше
+    # критерий считался по ступеням НАД d_max, а рабочие точки ставились ПОД
+    # ним, то есть кривизна экстраполировалась в область, где её не мерили.
+    #
+    # Это ничего не стоит. При window_points=7 и probe_step=1.2 полная лестница
+    # стоит 1/(1 - 1.2^-2) = 3.27 от нижней точки, а само окно (7 нижних
+    # ступеней) — 3.02. То есть на спуск сверх окна уходит 8% бюджета пары, и
+    # держать для него отдельную ослабленную точность смысла нет: все ступени
+    # меряются с полным rel_ci_target.
 
     # Априор для выбора СТАРТА лестницы: kappa ~ kappa_prior_coef * d'/sigma
     # (курсовая, 0.297 на диапазоне d'/sigma в [0.025; 0.385]). Используется
     # ТОЛЬКО чтобы выбрать, где мерить, — в результат не входит.
     kappa_prior_coef: float = 0.297
-    probe_target_deficit: float = 0.10   # целевой Δ/n_mf на верхней ступени
-    probe_step: float = 1.5              # делитель d на каждой ступени
-    probe_max_rungs: int = 20
-    probe_fit_points: int = 4            # сколько ПОСЛЕДНИХ ступеней идёт в фит rho
-    # Критерий проверяется только начиная с probe_fit_points ступеней: на двух
-    # точках фит (1, d) точен, остатков нет, и SE(rho) — чисто пропагированная
-    # ошибка; такой стоп заметно шумнее.
+    probe_target_deficit: float = 0.05   # целевой Δ/n_mf на верхней ступени
+    probe_step: float = 1.2              # делитель d на каждой ступени
+    probe_max_rungs: int = 40
+    window_points: int = 7               # длина окна в ступенях
+    # Размах окна = probe_step**(window_points - 1) = 1.2**6 = 2.99. Сужать его
+    # нельзя: SE(s) растёт как (1+W)/(W-1), и одновременно растёт остаточное
+    # смещение s от отброшенного члена (~1/W при фиксированном верхнем крае).
+    # Поэтому probe_step и window_points меняются только вместе, с сохранением
+    # W ≈ 3.
+
+    # Сколько ступеней считается параллельно за один заход. Лестница
+    # последовательна по смыслу, но при n_jobs>1 простаивать невыгодно: считаем
+    # пачку, потом проверяем гейт на всех новых окнах сразу. Перелёт в среднем
+    # (probe_batch-1)/2 ступеней — они остаются в таблице с in_window=False.
+    probe_batch: int = 4
 
     # Единственная граница на d — сверху, и она физическая. При d -> b система
     # подходит к границе вымирания, и портятся сразу две вещи, обе
@@ -68,11 +83,36 @@ class ExperimentConfig:
     probe_pop_min: int = 500
     probe_rate_frac: float = 0.30
 
-    bias_tol: float = 0.15            # допустимое |c/s| * d_max
-    n_production: int = 8             # рабочих точек на пару
-    window_ratio: float = 3.0         # d_max / d_min рабочего окна
+    # --- Гейт остановки -------------------------------------------------------
+    # Рабочая модель — Δ = s·d + c·d², в переменной g = Δ/d это g = s + c·d.
+    # Квадратика здесь не «второй член разложения в нуле», а способ снять
+    # остаточное искривление на окне; чтобы верить полученной κ, нужно, чтобы
+    # после её снятия данные были описаны. Отсюда два условия:
+    #
+    #   1) chi2_lin <= квантиль хи-квадрат(gof_confidence, ndf)
+    #      — двухчленная модель ОПИСЫВАЕТ данные. Это общий тест против любого
+    #        отклонения, а не против одного конкретного следующего монома.
+    #
+    #   2) nonlin_ratio + SE <= nonlin_tol,  nonlin_ratio = |c|·d_top/s
+    #      — режим пертурбативный, поправка не сравнима с самим сигналом.
+    #        Смещение κ это НЕ ограничивает (член c в модели), поэтому и имя
+    #        nonlin_tol, а не bias_tol.
+    #
+    # Отдельного теста на «третий член» нет и оценки возможного смещения тоже.
+    # Пробовалось, убрано: порог вида |nu| + 2·SE(nu) <= 0.6 заваливал ЗАВЕДОМО
+    # двухчленные данные в 47% случаев, а при выравнивании уровня ложных
+    # срабатываний до 5% не давал ничего сверх chi2 и на умеренных амплитудах
+    # был слабее него (Монте-Карло, 7 точек, W≈3, rel_ci_target=0.05).
+    #
+    # Границу применимости стоит держать в голове, но не в таблице: chi2
+    # проверяет модель на той точности, которая есть. Отклонение, почти
+    # неотличимое от прямой на окне шириной 3 (скажем, sqrt(d)), не видно ни
+    # этим тестом, ни каким-либо другим в пределах одного окна — это свойство
+    # экстраполяции, а не дефект критерия.
+    nonlin_tol: float = 0.15          # допустимое nonlin_ratio + SE
+    gof_confidence: float = 0.95      # уровень для хи-квадрат-квантиля
 
-    base_seed: int = 20260802
+    base_seed: int = 67
 
     # Warmup
     initial_density_frac: float = 0.1
@@ -109,26 +149,16 @@ class ExperimentConfig:
     # Критерий преподавателя: +-5% на разницу с mean field
     #   CI_half_width(n̂) ≤ rel_ci_target * |n̂ - n_MF|
     # При очень малой разнице (d≈0) — floor, чтобы не мерить вечно.
-    rel_ci_target: float = 0.05
-    # Разведке нужна не плотность, а КРИВИЗНА, поэтому порог ослаблен, но связан
-    # с bias_tol через сам критерий остановки лестницы. При SE(Δ) = rel*Δ/1.96 и
-    # Δ ≈ s*d получается SE(g) ≈ (rel/1.96)*s, а размах фита пропорционален
-    # текущему d, откуда
-    #       SE(rho) ≈ (rel/1.96) / d.
-    # Тогда критерий (rho + SE(rho))*d <= bias_tol превращается в
-    #       rho*d <= bias_tol - rel_probe/1.96,
-    # то есть лестница сходится к d_max ≈ (bias_tol - rel_probe/1.96) / rho.
-    # Отсюда жёсткое требование rel_ci_target_probe < 1.96 * bias_tol: иначе
-    # правая часть отрицательна и спуск не заканчивается никогда.
+    # Единая точность для ВСЕХ ступеней: окно состоит из тех же точек, по
+    # которым принимается решение, поэтому мерить их слабее нечем оправдать.
     #
-    # Значение выбрано минимизацией СУММАРНОГО времени пары. Стоимость точки
-    # ~ 1/(rel * d)², ступени лестницы образуют геометрический ряд с суммой
-    # 1/(1 - probe_step^-2) ≈ 1.8 от нижней, производственных точек n_production,
-    # и все они стоят у d ~ d_max, поэтому
-    #       T(rel_probe) ~ [1.8/rel_probe² + n_prod/rel_ci_target²]
-    #                       * rho² / (bias_tol - rel_probe/1.96)².
-    # Минимум лежит около 0.04 и он пологий.
-    rel_ci_target_probe: float = 0.04
+    # Оба условия гейта упираются в неё напрямую и от абсолютного d не зависят:
+    # в g-переменной SE(g) = eps·s постоянна, поэтому и разрешение chi2, и
+    # SE(nonlin_ratio) фиксированы точностью, а не глубиной спуска. При W≈3,
+    # n=7 это SE(s)/s ≈ 2.9%. Уменьшать rel_ci_target вдвое — вчетверо по
+    # времени, и на порог chi2 это не влияет: сходимость даёт спуск, а не
+    # точность точки.
+    rel_ci_target: float = 0.05
     delta_floor_frac: float = 0.00001  # floor = rel_ci_target * delta_floor_frac * |n_MF|
 
     # Параллельность
@@ -441,9 +471,10 @@ def compute_ci_target(
     CI_half_width ≤ rel_target * max(|delta|, floor)
       где floor = delta_floor_frac * |n_MF|   (чтобы не мерить вечно при delta → 0)
 
-    rel_target приходит аргументом: разведочные и рабочие точки считаются одной
-    и той же процедурой run_single_d, но с разными требованиями к точности
-    (cfg.rel_ci_target_probe против cfg.rel_ci_target).
+    rel_target приходит аргументом, а не берётся из cfg: точность — свойство
+    вызова, а не процедуры. Сейчас все ступени лестницы меряются с одним
+    cfg.rel_ci_target, но параметр оставлен явным, чтобы двухуровневую схему
+    можно было вернуть, не трогая run_single_d.
 
     Возвращает (target, is_strict):
       target    — порог для CI_half_width
@@ -482,7 +513,7 @@ def run_warmup(
     spawn_uniform(sim, 0, initial_pop, cfg.L, rng)
 
     def _return(phase1_chunks, tau_int, window_size, stability_windows,
-                tau_n_over_w=np.nan, pilot_samples=np.nan, pilot_iterations=np.nan, pilot_converged=np.nan,
+                tau_n_over_w=np.nan, pilot_samples=np.nan, pilot_iterations=np.nan, pilot_converged=False,
                 z_mean=np.nan, z_se=np.nan, z_t=np.nan,
                 A_est=np.nan, k_min=np.nan, flag=False):
         return {
@@ -892,33 +923,83 @@ def probe_start_d(cfg: ExperimentConfig, sigma: float, d_prime: float) -> float:
     return float(min(d, cap))
 
 
-def estimate_rho(
-    ds: list[float], deltas: list[float], ses: list[float]
-) -> dict:
+def _wls(x: NDArray[np.float64], y: NDArray[np.float64],
+         sy: NDArray[np.float64], degree: int) -> tuple | None:
     """
-    Оценка rho = |c/s| по разведочным точкам.
+    Взвешенный МНК y = sum_j p_j * x^j, j = 0..degree.
 
-    Дефицит Δ(d) = s·d + c·d², делим на d:
-        g(d) = Δ(d)/d = s + c·d.
-    Регрессоры (1, d) в такой форме хорошо обусловлены, веса SE(g) = SE(Δ)/d.
-    Это тот же взвешенный МНК, что и фит Δ через ноль, но численно устойчивее
-    и напрямую даёт s и c.
+    Веса берутся как ИЗВЕСТНЫЕ дисперсии: ковариация (X^T W X)^{-1} остаточным
+    разбросом не домножается. Та же конвенция, что в fit_kappa_per_pair. Иначе
+    chi2 потерял бы смысл теста: масштабирование ковариации остатками ровно
+    прячет тот промах модели, который этот тест и должен ловить.
 
-    Связь с диагностикой из анализа: nonlin_ratio = |c·d_max/s| = rho · d_max.
-    То есть rho — это nonlin_ratio, освобождённый от привязки к окну, и окно
-    из него получается делением: d_max = bias_tol / rho.
+    Возвращает (p, cov, chi2, ndf) или None, если система вырождена.
+    """
+    if x.size < degree + 1:
+        return None
+    X = np.vander(x, degree + 1, increasing=True)
+    w = 1.0 / sy**2
+    A = X.T @ (X * w[:, None])
+    if not np.all(np.isfinite(A)):
+        return None
+    try:
+        cov = np.linalg.inv(A)
+        p = cov @ (X.T @ (w * y))
+    except np.linalg.LinAlgError:
+        return None
+    if not (np.all(np.isfinite(cov)) and np.all(np.isfinite(p))):
+        return None
+    resid = (y - X @ p) / sy
+    return p, cov, float(resid @ resid), int(x.size - degree - 1)
 
-    Набор ключей на выходе одинаков во всех ветках, чтобы строки, сохранённые до
-    конца разведки, не отличались по составу колонок от итоговых.
+
+def _ratio_se(num: float, den: float, var_num: float, var_den: float,
+              cov: float, scale: float) -> float:
+    """
+    SE(scale * num / den) по полной дельта-формуле.
+
+    Нужна для nonlin_ratio = |c|·d_top/s — отношения, у которого шумят и
+    числитель, и знаменатель.
+
+    Члены с var_den и cov оставлены, хотя решают они мало: у окна вблизи гейта
+    поправка к SE составляет единицы процентов (измерено на семи точках, от
+    -0.3% до +1.5%), до 25-40% она дорастает только на окнах, которые гейт
+    заваливает с большим запасом, то есть там, где это уже ничего не меняет.
+    Держатся они не ради величины эффекта, а потому что формула для отношения
+    без них просто неверна, а стоят ноль.
+    """
+    if den == 0.0 or not np.isfinite(den):
+        return float("nan")
+    var = (var_num / den**2
+           + num**2 * var_den / den**4
+           - 2.0 * num * cov / den**3)
+    return float(scale * math.sqrt(var)) if var > 0.0 else float("nan")
+
+
+def window_metrics(ds: list[float], deltas: list[float],
+                   ses: list[float]) -> dict:
+    """
+    Все метрики окна по его собственным точкам.
+
+    Дефицит Δ(d) = s·d + c·d² + e·d³, делим на d:
+        g(d) = Δ(d)/d = s + c·d + e·d².
+    Регрессоры (1, d, d²) в такой форме обусловлены лучше, чем фит Δ через ноль,
+    веса SE(g) = SE(Δ)/d. Свободный член в Δ не вводится: Δ(0) = 0 доказано
+    точно (при d = 0 процесс пуассоновский и N(0) = b/d'), поэтому лишний
+    параметр только съел бы изгиб и замаскировал неадекватность модели.
+
+    Рабочая модель одна — двухчленная (s, c). Метрика режима:
+        nonlin_ratio = |c|·d_top / s   — размер поправки на верхнем крае окна.
+    Адекватность модели проверяется chi2_lin против квантиля, см. gate_passed.
     """
     out = {
-        "rho": np.nan,
-        "rho_se": np.nan,
-        "probe_s": np.nan,
-        "probe_s_se": np.nan,
-        "probe_c": np.nan,
-        "probe_c_se": np.nan,
-        "probe_points_used": 0,
+        "win_s": np.nan, "win_s_se": np.nan,
+        "win_c": np.nan, "win_c_se": np.nan,
+        "rho": np.nan, "rho_se": np.nan,
+        "nonlin_ratio": np.nan, "nonlin_ratio_se": np.nan,
+        "chi2_lin": np.nan, "ndf_lin": 0,
+        "win_points": 0,
+        "win_d_top": np.nan, "win_d_bot": np.nan, "win_ratio": np.nan,
     }
 
     d = np.asarray(ds, dtype=np.float64)
@@ -929,57 +1010,98 @@ def estimate_rho(
 
     ok = (np.isfinite(d) & np.isfinite(delta) & np.isfinite(se)
           & (se > 0.0) & (d > 0.0))
-    out["probe_points_used"] = int(ok.sum())
-    if ok.sum() < 2:
+    out["win_points"] = int(ok.sum())
+    if ok.sum() < 3:
         return out
 
     x = d[ok]
     g = delta[ok] / x
     sg = se[ok] / x
-    w = 1.0 / sg**2
+    d_top = float(x.max())
+    out["win_d_top"] = d_top
+    out["win_d_bot"] = float(x.min())
+    out["win_ratio"] = d_top / float(x.min())
 
-    Sw = float(w.sum())
-    Sx = float((w * x).sum())
-    Sxx = float((w * x * x).sum())
-    Sy = float((w * g).sum())
-    Sxy = float((w * x * g).sum())
-    det = Sw * Sxx - Sx * Sx
-    if not np.isfinite(det) or det <= 0.0:
-        return out
+    lin = _wls(x, g, sg, 1)
+    if lin is not None:
+        p, cov, chi2, ndf = lin
+        s_c, c_c = float(p[0]), float(p[1])
+        out.update({
+            "win_s": s_c, "win_s_se": float(math.sqrt(cov[0, 0])),
+            "win_c": c_c, "win_c_se": float(math.sqrt(cov[1, 1])),
+            "chi2_lin": chi2, "ndf_lin": ndf,
+        })
+        if np.isfinite(s_c) and s_c != 0.0 and np.isfinite(c_c):
+            out["rho"] = float(abs(c_c / s_c))
+            out["rho_se"] = _ratio_se(c_c, s_c, cov[1, 1], cov[0, 0],
+                                      cov[0, 1], 1.0)
+            out["nonlin_ratio"] = out["rho"] * d_top
+            out["nonlin_ratio_se"] = out["rho_se"] * d_top
 
-    s_coef = (Sxx * Sy - Sx * Sxy) / det
-    c_coef = (Sw * Sxy - Sx * Sy) / det
-
-    # Ковариация (X^T W X)^{-1} для X = [1, d]; веса взяты как известные
-    # дисперсии, поэтому остаточным разбросом матрица НЕ домножается —
-    # та же конвенция, что в fit_kappa_per_pair.
-    var_s = Sxx / det
-    var_c = Sw / det
-    cov_sc = -Sx / det
-
-    out["probe_s"] = float(s_coef)
-    out["probe_s_se"] = float(math.sqrt(var_s))
-    out["probe_c"] = float(c_coef)
-    out["probe_c_se"] = float(math.sqrt(var_c))
-
-    if not np.isfinite(s_coef) or s_coef == 0.0 or not np.isfinite(c_coef):
-        return out
-
-    # SE(rho) для rho = c/s — полная дельта-формула. Вклад ошибки знаменателя
-    # и корреляции s с c опускать нельзя: на четырёх разведочных точках это
-    # занижает SE(rho) примерно на 30%, а rho_se идёт прямо в критерий остановки.
-    var_rho = (var_c / s_coef**2
-               + c_coef**2 * var_s / s_coef**4
-               - 2.0 * c_coef * cov_sc / s_coef**3)
-
-    out["rho"] = float(abs(c_coef / s_coef))
-    out["rho_se"] = float(math.sqrt(var_rho)) if var_rho > 0.0 else np.nan
     return out
 
 
-def production_d_values(d_max: float, cfg: ExperimentConfig) -> NDArray[np.float64]:
-    """Геометрическая сетка на [d_max/window_ratio, d_max]."""
-    return np.geomspace(d_max / cfg.window_ratio, d_max, cfg.n_production)
+def rungs_remaining(m: dict, cfg: ExperimentConfig) -> int:
+    """
+    Прогноз: сколько ещё ступеней до срабатывания гейта.
+
+    nonlin_ratio = |c|·d_top/s пропорционален d_top, то есть падает ровно в
+    probe_step раз за ступень, поэтому число ступеней до порога считается в лоб:
+        n = ceil( log((nonlin+SE)/nonlin_tol) / log(probe_step) ).
+
+    Нужно это только чтобы сжимать пачку на подходе к остановке. Прогноз
+    систематически ЗАВЫШЕН (второе условие гейта, chi2, он не учитывает вовсе,
+    а SE в числителе почти не падает) — измерено: завышает в 9 окнах из 13 на
+    коротком спуске и в 17 из 22 на длинном. Для своей задачи это правильная
+    сторона ошибки: пачка сжимается позже, чем можно, но не раньше, чем нужно,
+    а преждевременное сжатие стоит всего параллелизма на самых дорогих
+    ступенях.
+
+    Возвращает большое число, если окна ещё нет или метрика не посчиталась —
+    тогда пачка берётся полной.
+    """
+    nl, nl_se = m.get("nonlin_ratio"), m.get("nonlin_ratio_se")
+    if nl is None or nl_se is None or not (np.isfinite(nl) and np.isfinite(nl_se)):
+        return 1 << 30
+    top = nl + nl_se
+    if top <= cfg.nonlin_tol:
+        return 1
+    step = math.log(cfg.probe_step)
+    if step <= 0.0:
+        return 1 << 30
+    return max(1, int(math.ceil(math.log(top / cfg.nonlin_tol) / step)))
+
+
+def gate_passed(m: dict, cfg: ExperimentConfig) -> bool:
+    """
+    Окно принимается, если выполнено И то, и другое:
+
+      1) двухчленная модель описывает данные:
+             chi2_lin <= chi2_ppf(gof_confidence, ndf_lin)
+      2) режим пертурбативный:
+             nonlin_ratio + SE(nonlin_ratio) <= nonlin_tol
+
+    Условие (1) — то самое «описывает ли модель данные», и порог у него не
+    произвольный допуск, а квантиль. «Не отвергли» означает «промах модели
+    меньше разрешения при этой точности» — не больше и не меньше того.
+
+    Условие (2) берётся с верхней границей, а не с точечной оценкой:
+    неразрешённая кривизна даёт большой SE и заставляет спуститься ещё на
+    ступень, вместо того чтобы пройти гейт по недостатку мощности.
+
+    Оба условия сходятся при спуске: в g-переменной SE постоянна (SE(g) ≈ eps·s
+    не зависит от d), а отклонение от прямой на окне падает как d_top².
+    """
+    vals = (m.get("nonlin_ratio"), m.get("nonlin_ratio_se"), m.get("chi2_lin"))
+    if not all(v is not None and np.isfinite(v) for v in vals):
+        return False
+    if int(m.get("ndf_lin", 0)) < 1:
+        return False
+    if m["chi2_lin"] > chi2_dist.ppf(cfg.gof_confidence, int(m["ndf_lin"])):
+        return False
+    if m["nonlin_ratio"] + m["nonlin_ratio_se"] > cfg.nonlin_tol:
+        return False
+    return True
 
 
 # =============================================================================
@@ -999,30 +1121,29 @@ def run_one_task(pair_cfg: ExperimentConfig, d_val: float, seed: int,
 
 def blank_pair_row(cfg: ExperimentConfig, sigma_val: float, d_prime_val: float) -> dict:
     """
-    Строка таблицы пар. Существует у КАЖДОЙ пары, включая те, где разведка
-    провалилась: иначе из таблицы точек не понять, почему пара исчезла.
+    Строка таблицы пар. Существует у КАЖДОЙ пары, включая те, где окно не
+    найдено: иначе из таблицы точек не понять, почему пара исчезла.
 
-    Ключи rho-блока берутся из самого estimate_rho, чтобы список не разъезжался
-    при его правке.
+    Ключи блока метрик берутся из самой window_metrics, чтобы список не
+    разъезжался при её правке.
     """
     row = {
         "sigma": sigma_val,
         "d_prime": d_prime_val,
         "b": cfg.b,
         "L": cfg.L,
-        "probe_ok": False,
-        "probe_rungs": 0,
-        "probe_d_start": np.nan,
-        "probe_d_top": np.nan,
-        "probe_d_bottom": np.nan,
-        "probe_d_cap": cfg.d_cap(d_prime_val),
+        "window_ok": False,
+        "stop_reason": "not_started",
+        "rungs": 0,
+        "ladder_d_start": np.nan,
+        "ladder_d_top": np.nan,
+        "ladder_d_bottom": np.nan,
+        "ladder_d_cap": cfg.d_cap(d_prime_val),
     }
-    row.update(estimate_rho([], [], []))
+    row.update(window_metrics([], [], []))
     row.update({
-        "d_max": np.nan,
-        "d_min": np.nan,
-        "n_production": 0,
-        "probe_time_wall": 0.0,
+        "kappa": np.nan,
+        "kappa_se": np.nan,
         "pair_time_wall": 0.0,
     })
     return row
@@ -1049,46 +1170,24 @@ def run_one_pair(cfg: ExperimentConfig, sigma_val: float, d_prime_val: float,
                  points_rows: list[dict], pairs_rows: list[dict],
                  flush=None) -> dict:
     """
-    Две фазы на одну пару (sigma, d_prime).
+    Одна фаза на пару (sigma, d_prime): лестница сверху вниз шагом probe_step.
 
-    A. Разведка — лестница сверху вниз с единственным критерием остановки:
+    Рабочим окном становятся window_points ПОСЛЕДНИХ измеренных ступеней — те
+    же самые точки, по которым проверен гейт. Никакой экстраполяции: и решение,
+    и результат живут на одном интервале по d.
 
-           (rho + SE(rho)) * d_cur <= bias_tol.
+    Гейт (см. gate_passed) проверяется на каждом новом окне по мере спуска.
+    Ступени считаются пачками по probe_batch штук, чтобы не простаивали ядра;
+    внутри пачки проверок нет, поэтому после неё окна перебираются в порядке
+    убывания d_bot и берётся ПЕРВОЕ прошедшее — то есть перелёт пачки на выбор
+    окна не влияет, он стоит только времени. Лишние нижние ступени остаются в
+    таблице точек с in_window=False.
 
-       Слева — консервативная (верхняя) оценка относительного вклада квадратики
-       на текущей ступени, справа — допуск. Как только неравенство выполнено,
-       текущая ступень и есть d_max: смещение на верхнем краю рабочего окна не
-       превышает bias_tol даже с учётом неопределённости самой кривизны.
+    Исход бинарный. Пара останавливается без окна, если очередная ступень не
+    измерилась (не сошёлся warmup) или кончились ступени; измеренные точки в
+    таблице остаются как есть.
 
-       Почему одного критерия достаточно:
-         * он завершается сам — d_cur падает геометрически, а SE(rho) ведёт себя
-           как (rel_probe/1.96)/d, поэтому левая часть стремится к
-           rho*d + rel_probe/1.96 и уходит под bias_tol (см. комментарий к
-           rel_ci_target_probe);
-         * он не требует «сначала точно измерить rho»: неразрешённая кривизна
-           даёт большой SE(rho) и просто заставляет спуститься ещё на ступень.
-
-       Защита от высших порядков — скользящее окно: rho фитится по
-       probe_fit_points ПОСЛЕДНИМ ступеням, поэтому по мере спуска верхние точки,
-       где кубический член ещё заметен, выпадают из фита сами. Размах фита при
-       probe_fit_points=4 и probe_step=1.5 равен 3.4 — примерно тот же, что и у
-       рабочего окна (window_ratio=3).
-
-       Исход бинарный. Разведка провалилась, если очередная ступень не
-       измерилась (не сошёлся warmup) или кончились ступени. Тогда пара
-       останавливается: probe_ok=False, фаза B не запускается, probe-точки
-       остаются в таблице точек как есть.
-
-       Ступени идут ПОСЛЕДОВАТЕЛЬНО — иначе нечего пересчитывать между ними.
-       Компенсируется тем, что probe меряется с ослабленным rel_ci_target_probe
-       и потому дёшев. Эти точки в фит κ НЕ идут (в таблице лежат с
-       phase="probe" и своим rel_ci_target_used).
-
-    B. Производство: n_production точек на [d_max/window_ratio, d_max],
-       параллельно внутри пары, с полным rel_ci_target.
-
-    Строка пары пишется СРАЗУ после фазы A (и обновляется временем в конце),
-    точки — после каждой посчитанной точки.
+    Строка пары обновляется после каждой точки, точки пишутся сразу.
     """
     pair_start = time.perf_counter()
     pair_cfg = replace(cfg, sigma=sigma_val, d_prime=d_prime_val)
@@ -1096,89 +1195,118 @@ def run_one_pair(cfg: ExperimentConfig, sigma_val: float, d_prime_val: float,
     pair_row = blank_pair_row(cfg, sigma_val, d_prime_val)
     pairs_rows.append(pair_row)
 
-    # --- Фаза A: лестница ----------------------------------------------------
-    d_start = probe_start_d(cfg, sigma_val, d_prime_val)
-    pair_row["probe_d_start"] = d_start
-    if not np.isfinite(d_start) or d_start <= 0.0:
-        pair_row["probe_time_wall"] = time.perf_counter() - pair_start
-        pair_row["pair_time_wall"] = pair_row["probe_time_wall"]
-        flush()
-        return pair_row
-
-    d_cur = d_start
-    ds: list[float] = []
-    deltas: list[float] = []
-    ses: list[float] = []
-    rho_info = estimate_rho([], [], [])
-    d_max = np.nan
-    probe_ok = False
-    rungs = 0
-
-    k = max(2, int(cfg.probe_fit_points))
-
-    for _ in range(cfg.probe_max_rungs):
-        seed = derive_seed(cfg, sigma_val, d_prime_val, 0, d_cur)
-        r = run_one_task(pair_cfg, d_cur, seed, cfg.rel_ci_target_probe, "probe")
-        rungs += 1
-        points_rows.append(r)
-        flush()
-
-        # В оценку rho берём CV-оценку: она и есть рабочий оценщик плотности,
-        # наивная остаётся в таблице только как диагностика.
-        measured = (r["warmup_reached_target"]
-                    and np.isfinite(r["cv_density_mean"])
-                    and np.isfinite(r["cv_density_mean_se"])
-                    and r["cv_density_mean_se"] > 0.0)
-        if not measured:
-            break
-
-        ds.append(float(r["d"]))
-        deltas.append(float(r["mf_density"] - r["cv_density_mean"]))
-        ses.append(float(r["cv_density_mean_se"]))
-
-        rho_info = estimate_rho(ds[-k:], deltas[-k:], ses[-k:])
-        rho, rho_se = rho_info["rho"], rho_info["rho_se"]
-        if (len(ds) >= k and np.isfinite(rho) and np.isfinite(rho_se)
-                and (rho + rho_se) * d_cur <= cfg.bias_tol):
-            d_max = d_cur
-            probe_ok = True
-            break
-
-        d_cur = d_cur / cfg.probe_step
-
-    pair_row.update(rho_info)
-    pair_row.update({
-        "probe_ok": probe_ok,
-        "probe_rungs": rungs,
-        "probe_d_top": float(max(ds)) if ds else np.nan,
-        "probe_d_bottom": float(min(ds)) if ds else np.nan,
-        "d_max": float(d_max) if np.isfinite(d_max) else np.nan,
-        "d_min": float(d_max / cfg.window_ratio) if np.isfinite(d_max) else np.nan,
-        "probe_time_wall": time.perf_counter() - pair_start,
-    })
-    pair_row["pair_time_wall"] = pair_row["probe_time_wall"]
-    flush()
-
-    if not probe_ok:
-        return pair_row
-
-    # --- Фаза B --------------------------------------------------------------
-    prod_jobs = [
-        delayed(run_one_task)(pair_cfg, d_val,
-                              derive_seed(cfg, sigma_val, d_prime_val, 1, d_val),
-                              cfg.rel_ci_target, "production")
-        for d_val in map(float, production_d_values(d_max, cfg))
-    ]
-    n_done = 0
-    for r in _parallel_generator(cfg, prod_jobs):
-        points_rows.append(r)
-        n_done += 1
-        pair_row["n_production"] = n_done
+    def touch() -> None:
         pair_row["pair_time_wall"] = time.perf_counter() - pair_start
         flush()
 
-    pair_row["pair_time_wall"] = time.perf_counter() - pair_start
-    flush()
+    d_start = probe_start_d(cfg, sigma_val, d_prime_val)
+    pair_row["ladder_d_start"] = d_start
+    if not np.isfinite(d_start) or d_start <= 0.0:
+        pair_row["stop_reason"] = "bad_start"
+        touch()
+        return pair_row
+
+    k = max(3, int(cfg.window_points))
+    batch = max(1, int(cfg.probe_batch))
+
+    # d ступени — ЧИСТАЯ функция её номера: d_j = d_start / probe_step**j.
+    # Накапливать делением нельзя: d/q/q и d/q**2 различаются в последнем бите,
+    # а derive_seed берёт биты float, поэтому от размера пачки менялся бы весь
+    # поток случайных чисел и вместе с ним выбранное окно.
+    def rung_d(j: int) -> float:
+        return float(d_start / cfg.probe_step**j)
+
+    rows: list[dict] = []      # измеренные строки, по убыванию d
+    ds: list[float] = []
+    deltas: list[float] = []
+    ses: list[float] = []
+    scanned = 0                # сколько окон уже проверено
+    metrics = window_metrics([], [], [])
+    win_lo = -1                # индекс нижней точки принятого окна
+    stop_reason = "max_rungs"
+
+    next_rung = 0
+    while next_rung < cfg.probe_max_rungs and win_lo < 0:
+        # Размер пачки сжимается на подходе к остановке: лишние ступени лежат
+        # НИЖЕ дна окна, а стоимость точки ~1/d², поэтому перелёт на три
+        # ступени при шаге 1.2 стоит втрое дороже всего остального спуска.
+        # Измерено на сквозной симуляции (40 сидов, выбранное окно то же):
+        # -21% CPU и -1% стенного на коротком спуске, -44% и -32% на длинном.
+        n_new = min(batch, rungs_remaining(metrics, cfg),
+                    cfg.probe_max_rungs - next_rung)
+        batch_ds = [rung_d(next_rung + i) for i in range(n_new)]
+        next_rung += n_new
+        jobs = [
+            delayed(run_one_task)(pair_cfg, d_val,
+                                  derive_seed(cfg, sigma_val, d_prime_val, 0, d_val),
+                                  cfg.rel_ci_target, "ladder")
+            for d_val in batch_ds
+        ]
+
+        done: list[dict] = []
+        for r in _parallel_generator(cfg, jobs):
+            r["in_window"] = False
+            done.append(r)
+            points_rows.append(r)
+            pair_row["rungs"] = len(rows) + len(done)
+            touch()
+
+        done.sort(key=lambda r: -float(r["d"]))
+
+        failed = False
+        for r in done:
+            # В метрики идёт CV-оценка: она и есть рабочий оценщик плотности,
+            # наивная остаётся в таблице только как диагностика.
+            measured = (r["warmup_reached_target"]
+                        and r["converged"]
+                        and r["is_strict"]
+                        and np.isfinite(r["cv_density_mean"])
+                        and np.isfinite(r["cv_density_mean_se"])
+                        and r["cv_density_mean_se"] > 0.0)
+            if not measured:
+                failed = True
+                break
+            rows.append(r)
+            ds.append(float(r["d"]))
+            deltas.append(float(r["mf_density"] - r["cv_density_mean"]))
+            ses.append(float(r["cv_density_mean_se"]))
+
+        # Окна перебираются снизу вверх по d_bot: первое прошедшее и есть ответ.
+        while scanned + k <= len(ds):
+            lo = scanned
+            m = window_metrics(ds[lo:lo + k], deltas[lo:lo + k], ses[lo:lo + k])
+            metrics = m
+            scanned += 1
+            if gate_passed(m, cfg):
+                win_lo = lo
+                stop_reason = "gate"
+                break
+
+        if failed:
+            if win_lo < 0:
+                stop_reason = "point_failed"
+            break
+
+    pair_row.update(metrics)
+    pair_row.update({
+        "window_ok": win_lo >= 0,
+        "stop_reason": stop_reason,
+        "rungs": len(rows),
+        "ladder_d_top": float(max(ds)) if ds else np.nan,
+        "ladder_d_bottom": float(min(ds)) if ds else np.nan,
+    })
+
+    if win_lo >= 0:
+        for r in rows[win_lo:win_lo + k]:
+            r["in_window"] = True
+        # kappa = s * d'. Больше в строку пары ничего не добавляется: окно
+        # принято потому, что модель его описывает, и приписывать к результату
+        # оценку «а вдруг всё-таки смещено» значило бы спорить с собственным
+        # критерием приёмки.
+        pair_row["kappa"] = float(metrics["win_s"] * d_prime_val)
+        pair_row["kappa_se"] = float(metrics["win_s_se"] * d_prime_val)
+
+    touch()
     return pair_row
 
 
@@ -1221,7 +1349,7 @@ def run_sigma_d_prime_grid(cfg: ExperimentConfig) -> tuple[list[dict], list[dict
     pairs_rows: list[dict] = []
 
     def flush() -> None:
-        save_table(points_rows, points_path, ["sigma", "d_prime", "phase", "d"])
+        save_table(points_rows, points_path, ["sigma", "d_prime", "d"])
         save_table(pairs_rows, pairs_path, ["sigma", "d_prime"])
 
     for sigma_val, d_prime_val in product(cfg.sigma_values, cfg.d_prime_values):
